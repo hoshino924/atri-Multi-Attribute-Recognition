@@ -1,6 +1,6 @@
 # ATRI Multi-Attribute Recognition
 
-![效果展示](<img width="1256" height="1615" alt="atri-multitask-cnn" src="https://github.com/user-attachments/assets/6c6a77ab-2e23-44c5-b2d9-1c4f55505bc7" />)
+![效果展示](https://github.com/user-attachments/assets/6c6a77ab-2e23-44c5-b2d9-1c4f55505bc7)
 
 基于 PyTorch 的多任务动漫角色属性识别项目。
 
