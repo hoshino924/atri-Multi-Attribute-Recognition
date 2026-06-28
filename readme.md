@@ -11,7 +11,9 @@
 
 项目最初来源于深度学习课程课题，后续进行了工程化整理与重构。
 
-![效果展示](https://github.com/user-attachments/assets/6c6a77ab-2e23-44c5-b2d9-1c4f55505bc7)
+<p align="center">
+  <img width="628" alt="效果展示" src="https://github.com/user-attachments/assets/6c6a77ab-2e23-44c5-b2d9-1c4f55505bc7" />
+</p>
 
 ---
 
