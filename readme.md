@@ -1,4 +1,6 @@
-# Anime Attribute Recognition
+# ATRI Multi-Attribute Recognition
+
+![效果展示](https://photos.app.goo.gl/UGBiMVc2uGbF1v5q7)
 
 基于 PyTorch 的多任务动漫角色属性识别项目。
 
@@ -34,6 +36,7 @@
 
 结构如下：
 
+```text
 Image
 ↓
 ResNet18 Feature Extractor
@@ -42,6 +45,7 @@ ResNet18 Feature Extractor
 ├─ Outfit Head
 ├─ Pose Head
 └─ Expression Head
+```
 
 ---
 
@@ -216,6 +220,8 @@ python infer.py --weight outputs/atri_net.pth
 ---
 
 # License
+
+本项目使用 MIT License，详见 LICENSE。
 
 本项目仅包含：
 
