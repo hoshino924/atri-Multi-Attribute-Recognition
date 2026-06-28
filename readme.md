@@ -1,5 +1,7 @@
 # ATRI Multi-Attribute Recognition
 
+[English](readme_en.md) | 中文
+
 基于 PyTorch 的多任务动漫角色属性识别项目。
 
 本项目使用 CNN（ResNet18）实现对角色立绘的多属性同时识别，包括：
@@ -135,7 +137,7 @@ pip install -r requirements.txt
 # 训练
 
 ```bash
-python train.py --train_dir atridataset/train
+python train.py --train_dir atridataset/train --epochs 30 --batch 32
 ```
 
 常用参数：
@@ -185,6 +187,7 @@ python infer.py --weight outputs/atri_net.pth
 ├── labels.py
 ├── requirements.txt
 ├── outputs/
+├── readme_en.md
 └── readme.md
 ```
 
