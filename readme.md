@@ -16,7 +16,7 @@
 # 功能特点
 
 - 基于 PyTorch 实现
-- 使用 CUDA 加速训练与推理
+- 支持 CUDA 加速训练与推理，未检测到 CUDA 时自动使用 CPU
 - 多任务 CNN（Multi-Task CNN）
 - GUI 图片推理界面
 - 训练与推理解耦
@@ -49,21 +49,56 @@ ResNet18 Feature Extractor
 
 训练数据使用单角色立绘数据集构建。
 
-文件名中包含属性标签，例如：
+文件名中包含属性标签，训练脚本会按下划线 `_` 分割文件名并读取固定位置的标签。
+
+文件名格式：
+
+```text
+<角色名>_<鞋袜标签>_<忽略字段>_<服装标签>_<姿势标签>_<表情标签>.png
+```
+
+例如：
 
 ```text
 アトリ_tatr01_l_d1_p1_f1.png
 ```
 
-其中：
+其中 `l` 为当前脚本不读取的字段。请避免在角色名前缀中额外使用下划线，否则可能导致标签解析位置错误。
 
-| 标签 | 含义 |
-|------|------|
-| tatr01 | shoes |
-| tatr02 | barefoot |
-| d1~d4 | outfit |
-| p1~p3 | pose |
-| f1~fl | expression |
+支持的标签如下：
+
+| 属性 | 标签 | 含义 |
+|------|------|------|
+| 鞋袜 | tatr01 | shoes |
+| 鞋袜 | tatr02 | barefoot |
+| 服装 | d1 | school uniform |
+| 服装 | d2 | swimsuit |
+| 服装 | d3 | pajamas |
+| 服装 | d4 | pajamas + pumpkin pants |
+| 姿势 | p1 | normal |
+| 姿势 | p2 | hands up |
+| 姿势 | p3 | arms horizontal + jump |
+| 表情 | f1 | staring |
+| 表情 | f2 | smile |
+| 表情 | f3 | happy |
+| 表情 | f4 | angry |
+| 表情 | f5 | serious |
+| 表情 | f6 | sad |
+| 表情 | f7 | distressed |
+| 表情 | f8 | surprised |
+| 表情 | f9 | confused |
+| 表情 | fa | troubled / embarrassed |
+| 表情 | fb | confident (eyes open) |
+| 表情 | fc | sleepy |
+| 表情 | fd | crying |
+| 表情 | fe | calm |
+| 表情 | ff | shy |
+| 表情 | fg | sulky |
+| 表情 | fh | shy (blush) |
+| 表情 | fi | blank |
+| 表情 | fj | disgusted |
+| 表情 | fk | shocked |
+| 表情 | fl | confident (eyes closed) |
 
 项目不会包含任何训练图片。
 
@@ -81,7 +116,7 @@ ResNet18 Feature Extractor
 
 - Python 3.10+
 - PyTorch 2.x
-- CUDA 11.x / 12.x
+- CUDA 11.x / 12.x（可选，用于 GPU 加速）
 
 安装依赖：
 
@@ -96,6 +131,19 @@ pip install -r requirements.txt
 ```bash
 python train.py --train_dir atridataset/train
 ```
+
+常用参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| --train_dir | atridataset/train | 训练图片目录 |
+| --out_dir | outputs | 权重与 loss 曲线输出目录 |
+| --epochs | 30 | 训练轮数 |
+| --batch | 32 | batch size |
+| --lr | 1e-4 | 学习率 |
+| --img_size | 224 | 输入图片缩放尺寸 |
+| --workers | 2 | DataLoader worker 数量 |
+| --cpu | 关闭 | 强制使用 CPU |
 
 训练完成后会生成：
 
@@ -131,7 +179,7 @@ python infer.py --weight outputs/atri_net.pth
 ├── labels.py
 ├── requirements.txt
 ├── outputs/
-└── README.md
+└── readme.md
 ```
 
 ---
@@ -176,5 +224,3 @@ python infer.py --weight outputs/atri_net.pth
 - 推理程序
 
 不包含任何训练图片资源。
-
-请勿将本项目用于商业用途。
