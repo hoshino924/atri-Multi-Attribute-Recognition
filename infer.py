@@ -1,56 +1,125 @@
 # -*- coding: utf-8 -*-
+"""Tkinter inference application for the three-task ATRI model."""
+
 import argparse
-import torch
-import torchvision.transforms as transforms
-from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog
 
+from PIL import Image, ImageTk
+import torch
+
+from dataset import build_expression_transform, build_transform
+from labels import TASK_CODES, TASK_LABELS
 from model import AtriNet
-from labels import SHOE_LABELS, OUTFIT_LABELS, POSE_LABELS, EXPR_LABELS
-from labels import SHOE_CODES, OUTFIT_CODES, POSE_CODES, EXPR_CODES
+
+
+TASKS = tuple(TASK_CODES.keys())
+
+
+def load_torch_checkpoint(path, device):
+    """Load a checkpoint without executing arbitrary serialized objects."""
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
 
 
 def load_model(weight_path, device):
-    """Load trained model weights."""
-    model = AtriNet().to(device)
+    """Load the model and preprocessing configuration from a checkpoint."""
+    checkpoint = load_torch_checkpoint(weight_path, device)
+    if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+        raise ValueError(
+            "this weight file uses the old four-task format; retrain the new "
+            "three-task model first"
+        )
+    if checkpoint.get("format_version") != 3:
+        raise ValueError(
+            "this checkpoint predates the focused expression view; retrain "
+            "the dual-view model first"
+        )
 
-    ckpt = torch.load(weight_path, map_location=device, weights_only=True)
-
-    if isinstance(ckpt, dict) and "model_state" in ckpt:
-        model.load_state_dict(ckpt["model_state"])
-    else:
-        model.load_state_dict(ckpt)
-
-    model.eval()
-    return model
-
-
-def predict(model, image_path, device, transform):
-    """Run prediction for one image."""
-    image = Image.open(image_path).convert("RGB")
-    x = transform(image).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        shoe_out, outfit_out, pose_out, expr_out = model(x)
-
-    shoe_id = torch.argmax(shoe_out, dim=1).item()
-    outfit_id = torch.argmax(outfit_out, dim=1).item()
-    pose_id = torch.argmax(pose_out, dim=1).item()
-    expr_id = torch.argmax(expr_out, dim=1).item()
-
-    result = {
-        "shoe": SHOE_LABELS[SHOE_CODES[shoe_id]],
-        "outfit": OUTFIT_LABELS[OUTFIT_CODES[outfit_id]],
-        "pose": POSE_LABELS[POSE_CODES[pose_id]],
-        "expression": EXPR_LABELS[EXPR_CODES[expr_id]],
+    label_codes = checkpoint.get("label_codes", TASK_CODES)
+    if set(label_codes.keys()) != set(TASKS):
+        raise ValueError(
+            f"checkpoint tasks {tuple(label_codes.keys())} do not match {TASKS}"
+        )
+    label_codes = {
+        task: list(label_codes[task])
+        for task in TASKS
     }
+
+    model_config = checkpoint.get("model_config", {})
+    task_sizes = {
+        task: len(label_codes[task])
+        for task in TASKS
+    }
+    model = AtriNet(
+        pretrained=False,
+        dropout=model_config.get("dropout", 0.2),
+        task_sizes=task_sizes,
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+
+    preprocess = checkpoint.get("preprocess", {})
+    full_config = preprocess.get("full", {})
+    expression_config = preprocess.get("expression", {})
+    background = tuple(preprocess.get("background", (0, 0, 0)))
+    normalization = preprocess.get("normalization", {})
+    mean = tuple(normalization.get("mean", (0.485, 0.456, 0.406)))
+    std = tuple(normalization.get("std", (0.229, 0.224, 0.225)))
+    image_transforms = {
+        "full": build_transform(
+            height=full_config.get("height", 512),
+            width=full_config.get("width", 320),
+            train=False,
+            margin=full_config.get("margin", 0.04),
+            background=background,
+            mean=mean,
+            std=std,
+        ),
+        "expression": build_expression_transform(
+            size=expression_config.get("size", 512),
+            train=False,
+            width_fraction=expression_config.get("width_fraction", 0.65),
+            height_fraction=expression_config.get("height_fraction", 0.50),
+            margin=expression_config.get("margin", 0.04),
+            background=background,
+            mean=mean,
+            std=std,
+        ),
+    }
+    return model, image_transforms, label_codes
+
+
+def predict(model, image_path, device, image_transforms, label_codes):
+    """Run prediction for one image."""
+    with Image.open(image_path) as source:
+        image = source.convert("RGBA")
+    full_tensor = image_transforms["full"](image).unsqueeze(0).to(device)
+    expression_tensor = (
+        image_transforms["expression"](image).unsqueeze(0).to(device)
+    )
+
+    with torch.inference_mode():
+        outputs = model(full_tensor, expression_tensor)
+
+    result = {}
+    for task in TASKS:
+        probabilities = torch.softmax(outputs[task], dim=1)
+        confidence, index = probabilities.max(dim=1)
+        code = label_codes[task][index.item()]
+        result[task] = {
+            "code": code,
+            "label": TASK_LABELS[task].get(code, code),
+            "confidence": confidence.item(),
+        }
 
     return image, result
 
 
-def start_gui(model, device, transform):
-    """Start simple Tkinter GUI."""
+def start_gui(model, device, image_transforms, label_codes):
+    """Start the image selection and prediction interface."""
     root = tk.Tk()
     root.title("ATRI Multi-Attribute Recognition")
     root.geometry("720x900")
@@ -58,79 +127,81 @@ def start_gui(model, device, transform):
     title = tk.Label(
         root,
         text="ATRI Multi-Attribute Recognition",
-        font=("Arial", 18, "bold")
+        font=("Arial", 18, "bold"),
     )
     title.pack(pady=10)
 
-    img_label = tk.Label(root)
-    img_label.pack(pady=10)
+    image_label = tk.Label(root)
+    image_label.pack(pady=10)
 
     result_label = tk.Label(
         root,
         text="Please select an image.",
         font=("Arial", 14),
-        justify="left"
+        justify="left",
     )
     result_label.pack(pady=10)
 
     def open_image():
-        """Select an image and show prediction."""
         path = filedialog.askopenfilename(
             title="Select image",
             filetypes=[
                 ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                ("All files", "*.*")
-            ]
+                ("All files", "*.*"),
+            ],
         )
-
         if not path:
             return
 
-        image, result = predict(model, path, device, transform)
-
-        show_img = image.copy()
-        show_img.thumbnail((500, 650))
-
-        tk_img = ImageTk.PhotoImage(show_img)
-        img_label.configure(image=tk_img)
-        img_label.image = tk_img
+        image, result = predict(
+            model,
+            path,
+            device,
+            image_transforms,
+            label_codes,
+        )
+        display_image = image.copy()
+        display_image.thumbnail((500, 650))
+        tk_image = ImageTk.PhotoImage(display_image)
+        image_label.configure(image=tk_image)
+        image_label.image = tk_image
 
         text = (
-            f"Shoe       : {result['shoe']}\n"
-            f"Outfit     : {result['outfit']}\n"
-            f"Pose       : {result['pose']}\n"
-            f"Expression : {result['expression']}"
+            f"Outfit     : {result['outfit']['label']} "
+            f"({result['outfit']['confidence']:.1%})\n"
+            f"Pose       : {result['pose']['label']} "
+            f"({result['pose']['confidence']:.1%})\n"
+            f"Expression : {result['expression']['label']} "
+            f"({result['expression']['confidence']:.1%})"
         )
-
         result_label.configure(text=text)
 
-    btn = tk.Button(
+    button = tk.Button(
         root,
         text="Select Image",
         command=open_image,
         font=("Arial", 14),
-        width=20
+        width=20,
     )
-    btn.pack(pady=15)
-
+    button.pack(pady=15)
     root.mainloop()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weight", type=str, default="outputs/atri_net.pth")
+    parser.add_argument("--weight", default="outputs/atri_net_best.pth")
+    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available() and not args.cpu
+        else "cpu"
+    )
     print("Using device:", device)
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
-    ])
-
-    model = load_model(args.weight, device)
-    start_gui(model, device, transform)
+    model, image_transforms, label_codes = load_model(args.weight, device)
+    start_gui(model, device, image_transforms, label_codes)
 
 
 if __name__ == "__main__":
