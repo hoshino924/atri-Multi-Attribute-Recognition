@@ -7,7 +7,7 @@ A PyTorch-based single-character multi-attribute recognition project for jointly
 The project originated as a deep learning course assignment and was later refactored to address duplicate training images, aspect-ratio distortion, insufficient expression resolution, and limited training evaluation.
 
 <p align="center">
-  <img width="628" alt="Demo" src="https://github.com/user-attachments/assets/6c6a77ab-2e23-44c5-b2d9-1c4f55505bc7" />
+  <img width="628" alt="Demo" src="https://github.com/user-attachments/assets/444c8c7f-6e7a-4acf-8231-ec82349e1cd9" />
 </p>
 
 ## Features
@@ -25,18 +25,28 @@ The project originated as a deep learning course assignment and was later refact
 
 The model uses two input views while sharing one set of ResNet18 parameters:
 
-```text
-Full image (512 x 320)
-    -> Shared ResNet18
-    -> Full feature --------------------------+
-       |-> Outfit head                        |
-       `-> Pose head                          v
-                                            Concat -> Expression head
-                                               ^
-                                               |
-Expression crop (512 x 512)
-    -> Same shared ResNet18
-    -> Local feature --------------------------+
+```mermaid
+flowchart TB
+    image["Original image"]
+    image --> full_input["Full-image preprocessing<br/>Aspect-ratio fit to 512 x 320"]
+    image --> crop["Alpha foreground crop<br/>Central 65% / top 50%"]
+    crop --> expression_input["Focused expression view<br/>Aspect-ratio fit to 512 x 512"]
+
+    subgraph backbone["Shared ResNet18 (same parameters)"]
+        full_forward["Full-image forward pass"]
+        expression_forward["Expression-view forward pass"]
+    end
+
+    full_input --> full_forward
+    expression_input --> expression_forward
+    full_forward --> full_feature["Full-image feature"]
+    expression_forward --> local_feature["Local expression feature"]
+
+    full_feature --> outfit["Outfit classification"]
+    full_feature --> pose["Pose classification"]
+    full_feature --> fusion["Feature concatenation"]
+    local_feature --> fusion
+    fusion --> expression["Expression classification"]
 ```
 
 The full image is resized with its aspect ratio preserved and padded before being used for outfit, pose, and global-context features. The expression view locates the foreground through transparency and crops the central `65%` of its width and the top `50%` of its height. The expression head fuses the full-image and local features.

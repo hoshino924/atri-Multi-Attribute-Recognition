@@ -7,7 +7,7 @@
 项目最初来源于深度学习课程课题，之后针对数据重复、图像拉伸、表情区域过小和训练评估不足等问题进行了重构。
 
 <p align="center">
-  <img width="628" alt="效果展示" src="https://github.com/user-attachments/assets/6c6a77ab-2e23-44c5-b2d9-1c4f55505bc7" />
+  <img width="628" alt="效果展示" src="https://github.com/user-attachments/assets/444c8c7f-6e7a-4acf-8231-ec82349e1cd9" />
 </p>
 
 ## 功能特点
@@ -25,18 +25,28 @@
 
 模型使用两种输入视图，但两路计算共享同一套 ResNet18 参数：
 
-```text
-Full image (512 x 320)
-    -> Shared ResNet18
-    -> Full feature --------------------------+
-       |-> Outfit head                        |
-       `-> Pose head                          v
-                                            Concat -> Expression head
-                                               ^
-                                               |
-Expression crop (512 x 512)
-    -> Same shared ResNet18
-    -> Local feature --------------------------+
+```mermaid
+flowchart TB
+    image["原始图片"]
+    image --> full_input["完整图预处理<br/>保持比例填充到 512 x 320"]
+    image --> crop["Alpha 前景裁剪<br/>中央 65% / 顶部 50%"]
+    crop --> expression_input["表情局部图<br/>保持比例填充到 512 x 512"]
+
+    subgraph backbone["共享 ResNet18（同一套参数）"]
+        full_forward["完整图前向计算"]
+        expression_forward["表情局部图前向计算"]
+    end
+
+    full_input --> full_forward
+    expression_input --> expression_forward
+    full_forward --> full_feature["完整图特征"]
+    expression_forward --> local_feature["局部表情特征"]
+
+    full_feature --> outfit["服装分类"]
+    full_feature --> pose["姿势分类"]
+    full_feature --> fusion["特征拼接"]
+    local_feature --> fusion
+    fusion --> expression["表情分类"]
 ```
 
 完整图经过保持比例缩放和填充后用于服装、姿势及全局上下文提取。表情视图根据透明通道确定人物前景，再截取前景中央 `65%`、顶部 `50%` 的区域。表情头融合完整图特征和局部特征。
