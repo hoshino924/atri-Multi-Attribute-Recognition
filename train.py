@@ -3,22 +3,28 @@
 
 import argparse
 from collections import Counter
+import csv
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
+import platform
 import random
+import sys
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torchvision
 
+from calibration import build_calibration, collect_logits
 from dataset import (
     AtriDataset,
     IMAGENET_MEAN,
     IMAGENET_STD,
     SCALE_CODES,
-    build_expression_transform,
-    build_transform,
+    build_dual_view_transform,
     scan_records,
     stratified_split,
 )
@@ -28,6 +34,11 @@ from model import AtriNet
 
 TASKS = tuple(TASK_CODES.keys())
 CHECKPOINT_VERSION = 3
+PROTECTED_OUTPUT_NAMES = {
+    "atri_net_best.pth",
+    "atri_net_last.pth",
+    "metrics.json",
+}
 
 
 def seed_everything(seed):
@@ -36,6 +47,71 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def prepare_output_directory(args):
+    """Resolve one run directory and guard existing training artifacts."""
+    if args.run_name:
+        if (
+            args.run_name in {".", ".."}
+            or os.path.basename(args.run_name) != args.run_name
+        ):
+            raise ValueError("--run_name must be a single directory name")
+        out_dir = os.path.join(args.out_dir, args.run_name)
+    else:
+        out_dir = args.out_dir
+
+    if not args.resume and os.path.isdir(out_dir) and not args.overwrite:
+        existing = PROTECTED_OUTPUT_NAMES.intersection(os.listdir(out_dir))
+        if existing:
+            names = ", ".join(sorted(existing))
+            raise FileExistsError(
+                f"output directory already contains {names}: {out_dir}. "
+                "Use --run_name for a new run or --overwrite to replace them."
+            )
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def dataset_signature(records, root):
+    """Fingerprint selected filenames and sizes to protect resumed splits."""
+    root = os.path.abspath(root)
+    digest = hashlib.sha256()
+    for record in sorted(records, key=lambda item: item.path.name):
+        path = os.path.abspath(record.path)
+        relative_path = os.path.relpath(path, root).replace("\\", "/")
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(os.path.getsize(path)).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def save_json(path, value):
+    """Write one UTF-8 JSON artifact."""
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+
+
+def save_run_metadata(out_dir, args, device):
+    """Record arguments and the software/hardware environment."""
+    save_json(os.path.join(out_dir, "run_config.json"), vars(args))
+    environment = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+        "device": str(device),
+        "gpu": (
+            torch.cuda.get_device_name(device)
+            if device.type == "cuda"
+            else None
+        ),
+    }
+    save_json(os.path.join(out_dir, "environment.json"), environment)
 
 
 def print_record_summary(name, records):
@@ -50,7 +126,14 @@ def print_record_summary(name, records):
         print(f"  {task}: {detail}")
 
 
-def save_split_manifest(path, root, train_records, val_records, args):
+def save_split_manifest(
+    path,
+    root,
+    train_records,
+    val_records,
+    args,
+    data_signature,
+):
     """Record the exact split used for this run."""
     root = os.path.abspath(root)
 
@@ -64,11 +147,11 @@ def save_split_manifest(path, root, train_records, val_records, args):
         "seed": args.seed,
         "val_ratio": args.val_ratio,
         "scale": args.scale,
+        "dataset_signature": data_signature,
         "train": relative_names(train_records),
         "validation": relative_names(val_records),
     }
-    with open(path, "w", encoding="utf-8") as stream:
-        json.dump(manifest, stream, ensure_ascii=False, indent=2)
+    save_json(path, manifest)
 
 
 def move_targets(targets, device):
@@ -97,12 +180,15 @@ def run_epoch(
     scaler=None,
     gradient_clip=0.0,
     backbone_trainable=True,
+    freeze_bn_statistics=False,
 ):
     """Run one training or validation epoch and return aggregate metrics."""
     training = optimizer is not None
     model.train(training)
     if training and not backbone_trainable:
         model.backbone.eval()
+    elif training and freeze_bn_statistics:
+        model.freeze_backbone_batchnorm()
 
     sample_count = 0
     total_loss = 0.0
@@ -204,13 +290,22 @@ def format_metrics(name, metrics):
     )
 
 
-def make_checkpoint(model, args, epoch, best_expression_loss, history):
+def make_checkpoint(
+    model,
+    args,
+    epoch,
+    best_expression_loss,
+    history,
+    calibration=None,
+    data_signature=None,
+):
     """Create the inference-compatible part of a checkpoint."""
     return {
         "format_version": CHECKPOINT_VERSION,
         "model_state": model.state_dict(),
         "epoch": epoch,
         "best_expression_loss": best_expression_loss,
+        "dataset_signature": data_signature,
         "model_config": {
             "backbone": "resnet18",
             "architecture": "dual_view_shared_backbone",
@@ -245,6 +340,7 @@ def make_checkpoint(model, args, epoch, best_expression_loss, history):
         },
         "train_args": vars(args),
         "history": history,
+        "calibration": calibration or {},
     }
 
 
@@ -256,12 +352,17 @@ def load_torch_checkpoint(path, device):
         return torch.load(path, map_location=device)
 
 
-def validate_resume_config(checkpoint, args):
+def validate_resume_config(checkpoint, args, data_signature):
     """Reject a resume checkpoint built with incompatible data settings."""
     if checkpoint.get("format_version") != CHECKPOINT_VERSION:
         raise ValueError("resume checkpoint format is not compatible")
     if checkpoint.get("label_codes") != TASK_CODES:
         raise ValueError("resume checkpoint label definitions do not match")
+    checkpoint_signature = checkpoint.get("dataset_signature")
+    if checkpoint_signature and checkpoint_signature != data_signature:
+        raise ValueError(
+            "the selected dataset changed since this checkpoint was created"
+        )
 
     model_config = checkpoint.get("model_config", {})
     if model_config.get("dropout") != args.dropout:
@@ -324,6 +425,7 @@ def restore_training_state(
         checkpoint.get("best_expression_loss", float("inf")),
         checkpoint.get("epochs_without_improvement", 0),
         checkpoint.get("history", []),
+        checkpoint.get("calibration", {}),
     )
 
 
@@ -366,6 +468,51 @@ def save_plots(history, out_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "accuracy_curve.png"), dpi=200)
     plt.close()
+
+
+def save_metrics(history, out_dir):
+    """Save complete JSON history and a compact comparison-friendly CSV."""
+    save_json(os.path.join(out_dir, "metrics.json"), history)
+    fieldnames = [
+        "epoch",
+        "split",
+        "loss",
+        "outfit_loss",
+        "pose_loss",
+        "expression_loss",
+        "outfit_accuracy",
+        "pose_accuracy",
+        "expression_accuracy",
+        "joint_accuracy",
+        "backbone_lr",
+        "heads_lr",
+    ]
+    with open(
+        os.path.join(out_dir, "metrics.csv"),
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in history:
+            learning_rates = item.get("learning_rates", {})
+            for split_name in ("train", "validation"):
+                metrics = item[split_name]
+                writer.writerow({
+                    "epoch": item["epoch"],
+                    "split": split_name,
+                    "loss": metrics["loss"],
+                    "outfit_loss": metrics["task_loss"]["outfit"],
+                    "pose_loss": metrics["task_loss"]["pose"],
+                    "expression_loss": metrics["task_loss"]["expression"],
+                    "outfit_accuracy": metrics["accuracy"]["outfit"],
+                    "pose_accuracy": metrics["accuracy"]["pose"],
+                    "expression_accuracy": metrics["accuracy"]["expression"],
+                    "joint_accuracy": metrics["joint_accuracy"],
+                    "backbone_lr": learning_rates.get("backbone"),
+                    "heads_lr": learning_rates.get("heads"),
+                })
 
 
 def save_expression_report(metrics, out_dir):
@@ -431,12 +578,15 @@ def validate_args(args):
         raise ValueError("--label_smoothing must be in [0, 1)")
     if args.gradient_clip < 0.0:
         raise ValueError("--gradient_clip cannot be negative")
+    if not 0.0 <= args.threshold_quantile <= 0.5:
+        raise ValueError("--threshold_quantile must be in [0, 0.5]")
 
 
 def train(args):
     """Run the complete training and validation workflow."""
     validate_args(args)
     seed_everything(args.seed)
+    args.out_dir = prepare_output_directory(args)
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not args.cpu
@@ -450,14 +600,17 @@ def train(args):
 
     print("Device:", device)
     print("Automatic mixed precision:", "enabled" if amp_enabled else "disabled")
+    print("BatchNorm statistics:", "train" if args.train_bn else "frozen")
     print(
         "Input views:",
         f"full={args.height}x{args.width}",
         f"expression={args.expression_size}x{args.expression_size}",
     )
-    os.makedirs(args.out_dir, exist_ok=True)
+    print("Output directory:", args.out_dir)
+    save_run_metadata(args.out_dir, args, device)
 
     records = scan_records(args.train_dir, scale=args.scale)
+    data_signature = dataset_signature(records, args.train_dir)
     train_records, val_records = stratified_split(
         records,
         val_ratio=args.val_ratio,
@@ -471,37 +624,30 @@ def train(args):
         train_records,
         val_records,
         args,
+        data_signature,
     )
 
     train_dataset = AtriDataset(
         train_records,
-        full_transform=build_transform(
+        paired_transform=build_dual_view_transform(
             height=args.height,
             width=args.width,
+            expression_size=args.expression_size,
             train=True,
-            margin=args.margin,
-        ),
-        expression_transform=build_expression_transform(
-            size=args.expression_size,
-            train=True,
-            width_fraction=args.expression_width_fraction,
-            height_fraction=args.expression_height_fraction,
+            expression_width_fraction=args.expression_width_fraction,
+            expression_height_fraction=args.expression_height_fraction,
             margin=args.margin,
         ),
     )
     val_dataset = AtriDataset(
         val_records,
-        full_transform=build_transform(
+        paired_transform=build_dual_view_transform(
             height=args.height,
             width=args.width,
+            expression_size=args.expression_size,
             train=False,
-            margin=args.margin,
-        ),
-        expression_transform=build_expression_transform(
-            size=args.expression_size,
-            train=False,
-            width_fraction=args.expression_width_fraction,
-            height_fraction=args.expression_height_fraction,
+            expression_width_fraction=args.expression_width_fraction,
+            expression_height_fraction=args.expression_height_fraction,
             margin=args.margin,
         ),
     )
@@ -544,21 +690,26 @@ def train(args):
         T_max=max(1, args.epochs - args.warmup_epochs),
         eta_min=args.min_lr,
     )
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    train_loss_fn = nn.CrossEntropyLoss(
+        label_smoothing=args.label_smoothing,
+    )
+    validation_loss_fn = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
 
     start_epoch = 0
     best_expression_loss = float("inf")
     epochs_without_improvement = 0
     history = []
+    best_calibration = {}
     if args.resume:
         checkpoint = load_torch_checkpoint(args.resume, device)
-        validate_resume_config(checkpoint, args)
+        validate_resume_config(checkpoint, args, data_signature)
         (
             start_epoch,
             best_expression_loss,
             epochs_without_improvement,
             history,
+            best_calibration,
         ) = restore_training_state(
             checkpoint,
             model,
@@ -580,19 +731,20 @@ def train(args):
         train_metrics = run_epoch(
             model,
             train_loader,
-            loss_fn,
+            train_loss_fn,
             device,
             amp_enabled,
             optimizer=optimizer,
             scaler=scaler,
             gradient_clip=args.gradient_clip,
             backbone_trainable=backbone_trainable,
+            freeze_bn_statistics=not args.train_bn,
         )
         with torch.inference_mode():
             val_metrics = run_epoch(
                 model,
                 val_loader,
-                loss_fn,
+                validation_loss_fn,
                 device,
                 amp_enabled,
             )
@@ -604,6 +756,10 @@ def train(args):
             "epoch": epoch,
             "train": train_metrics,
             "validation": val_metrics,
+            "learning_rates": {
+                "backbone": optimizer.param_groups[0]["lr"],
+                "heads": optimizer.param_groups[1]["lr"],
+            },
         })
         print(f"Epoch [{epoch}/{args.epochs}]")
         print(" ", format_metrics("train", train_metrics))
@@ -617,12 +773,27 @@ def train(args):
         else:
             epochs_without_improvement += 1
 
+        if improved:
+            collected = collect_logits(
+                model,
+                val_loader,
+                device,
+                TASKS,
+                amp_enabled=amp_enabled,
+            )
+            best_calibration = build_calibration(
+                collected,
+                threshold_quantile=args.threshold_quantile,
+            )
+
         checkpoint = make_checkpoint(
             model,
             args,
             epoch,
             best_expression_loss,
             history,
+            calibration=best_calibration,
+            data_signature=data_signature,
         )
         checkpoint.update({
             "optimizer_state": optimizer.state_dict(),
@@ -639,10 +810,18 @@ def train(args):
                 epoch,
                 best_expression_loss,
                 history,
+                calibration=best_calibration,
+                data_signature=data_signature,
             )
             torch.save(best_checkpoint, best_path)
             save_expression_report(val_metrics, args.out_dir)
+            save_json(
+                os.path.join(args.out_dir, "calibration.json"),
+                best_calibration,
+            )
             print("  Saved new best checkpoint.")
+
+        save_metrics(history, args.out_dir)
 
         if epochs_without_improvement >= args.patience:
             print(
@@ -656,6 +835,9 @@ def train(args):
     print("Saved:", last_path)
     print("Saved:", os.path.join(args.out_dir, "loss_curve.png"))
     print("Saved:", os.path.join(args.out_dir, "accuracy_curve.png"))
+    print("Saved:", os.path.join(args.out_dir, "metrics.json"))
+    print("Saved:", os.path.join(args.out_dir, "metrics.csv"))
+    print("Saved:", os.path.join(args.out_dir, "calibration.json"))
     print("Saved:", os.path.join(args.out_dir, "expression_report.json"))
     print(
         "Saved:",
@@ -664,9 +846,13 @@ def train(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Train the ATRI three-task dual-view classifier."
+    )
     parser.add_argument("--train_dir", default="atridataset/train")
     parser.add_argument("--out_dir", default="outputs")
+    parser.add_argument("--run_name", help="optional subdirectory for this run")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--epochs", type=int, default=90)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--height", type=int, default=512)
@@ -686,9 +872,15 @@ def parse_args():
     parser.add_argument("--gradient_clip", type=float, default=5.0)
     parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--threshold_quantile", type=float, default=0.05)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--train_bn",
+        action="store_true",
+        help="update backbone BatchNorm statistics instead of freezing them",
+    )
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no_pretrained", action="store_true")
     parser.add_argument("--no_amp", action="store_true")

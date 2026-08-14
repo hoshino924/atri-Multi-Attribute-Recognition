@@ -57,3 +57,9 @@ class AtriNet(nn.Module):
         """Freeze or unfreeze the shared feature extractor."""
         for parameter in self.backbone.parameters():
             parameter.requires_grad = trainable
+
+    def freeze_backbone_batchnorm(self):
+        """Keep pretrained BatchNorm running statistics fixed while training."""
+        for module in self.backbone.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
