@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+atridataset/
+outputs/
+outputs_*/
+evaluation/
+dataset_report.json
+*.onnx

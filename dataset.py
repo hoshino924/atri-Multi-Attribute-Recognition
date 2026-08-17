@@ -2,13 +2,16 @@
 """Dataset parsing, splitting, and image transforms."""
 
 from collections import defaultdict
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 import random
 
 from PIL import Image, ImageOps
+import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
+from torchvision.transforms import functional as transform_functional
 
 from labels import EXPR_CODES, OUTFIT_CODES, POSE_CODES
 
@@ -41,6 +44,16 @@ class ImageRecord:
             self.pose,
             self.expression,
         )
+
+
+@dataclass(frozen=True)
+class LabeledImageRecord:
+    """One externally named image with labels supplied by a CSV manifest."""
+
+    path: Path
+    outfit: str
+    pose: str
+    expression: str
 
 
 def parse_filename(path):
@@ -115,6 +128,83 @@ def scan_records(root, scale="w"):
         names = ", ".join(duplicates[:10])
         raise ValueError(f"duplicate content records for scale '{scale}': {names}")
 
+    return records
+
+
+def load_label_manifest(root, manifest_path):
+    """Load filename and three task labels from a UTF-8 CSV manifest."""
+    root = Path(root).resolve()
+    manifest_path = Path(manifest_path)
+    required_columns = {"filename", "outfit", "pose", "expression"}
+    records = []
+    seen_paths = set()
+
+    if not root.is_dir():
+        raise FileNotFoundError(f"image directory does not exist: {root}")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"label manifest does not exist: {manifest_path}")
+
+    with manifest_path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        fieldnames = set(reader.fieldnames or ())
+        missing = required_columns - fieldnames
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise ValueError(f"label manifest is missing columns: {names}")
+
+        for line_number, row in enumerate(reader, start=2):
+            filename = (row.get("filename") or "").strip()
+            if not filename:
+                raise ValueError(f"empty filename at manifest line {line_number}")
+
+            path = (root / filename).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"filename escapes the image directory at line {line_number}: "
+                    f"{filename}"
+                ) from exc
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"manifest image does not exist at line {line_number}: {path}"
+                )
+            if path.suffix.lower() not in IMAGE_EXTENSIONS:
+                raise ValueError(
+                    f"unsupported image extension at line {line_number}: {filename}"
+                )
+            if path in seen_paths:
+                raise ValueError(
+                    f"duplicate manifest filename at line {line_number}: {filename}"
+                )
+
+            labels = {
+                task: (row.get(task) or "").strip()
+                for task in ("outfit", "pose", "expression")
+            }
+            for task, code in labels.items():
+                valid_codes = {
+                    "outfit": OUTFIT_CODES,
+                    "pose": POSE_CODES,
+                    "expression": EXPR_CODES,
+                }[task]
+                if code not in valid_codes:
+                    raise ValueError(
+                        f"unknown {task} code at line {line_number}: {code}"
+                    )
+
+            records.append(
+                LabeledImageRecord(
+                    path=path,
+                    outfit=labels["outfit"],
+                    pose=labels["pose"],
+                    expression=labels["expression"],
+                )
+            )
+            seen_paths.add(path)
+
+    if not records:
+        raise ValueError(f"label manifest contains no records: {manifest_path}")
     return records
 
 
@@ -219,6 +309,120 @@ class ForegroundRegionCrop:
         return image.crop((crop_left, top, crop_right, crop_bottom))
 
 
+def build_full_preview(
+    height=512,
+    width=320,
+    margin=0.04,
+    background=(0, 0, 0),
+):
+    """Build the deterministic full-image view as a displayable PIL image."""
+    return FitPad(
+        height=height,
+        width=width,
+        margin=margin,
+        background=background,
+    )
+
+
+def build_expression_preview(
+    size=512,
+    width_fraction=0.65,
+    height_fraction=0.50,
+    margin=0.04,
+    background=(0, 0, 0),
+):
+    """Build the deterministic expression crop as a displayable PIL image."""
+    return transforms.Compose([
+        ForegroundRegionCrop(
+            width_fraction=width_fraction,
+            height_fraction=height_fraction,
+        ),
+        FitPad(
+            height=size,
+            width=size,
+            margin=margin,
+            background=background,
+        ),
+    ])
+
+
+class PairedViewTransform:
+    """Create both views while sharing all randomly sampled augmentations."""
+
+    def __init__(
+        self,
+        full_preview,
+        expression_preview,
+        train=False,
+        background=(0, 0, 0),
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD,
+    ):
+        self.full_preview = full_preview
+        self.expression_preview = expression_preview
+        self.train = train
+        self.background = tuple(background)
+        self.mean = tuple(mean)
+        self.std = tuple(std)
+
+    @staticmethod
+    def _uniform(low, high):
+        return torch.empty(1).uniform_(low, high).item()
+
+    def _augment_pair(self, full_image, expression_image):
+        images = [full_image, expression_image]
+        if torch.rand(1).item() < 0.5:
+            images = [transform_functional.hflip(image) for image in images]
+
+        angle = self._uniform(-3.0, 3.0)
+        translate_x = self._uniform(-0.02, 0.02)
+        translate_y = self._uniform(-0.02, 0.02)
+        scale = self._uniform(0.95, 1.02)
+        images = [
+            transform_functional.affine(
+                image,
+                angle=angle,
+                translate=[
+                    round(translate_x * image.width),
+                    round(translate_y * image.height),
+                ],
+                scale=scale,
+                shear=[0.0, 0.0],
+                interpolation=transforms.InterpolationMode.BILINEAR,
+                fill=self.background,
+            )
+            for image in images
+        ]
+
+        brightness = self._uniform(0.92, 1.08)
+        contrast = self._uniform(0.92, 1.08)
+        saturation = self._uniform(0.92, 1.08)
+        adjusted = []
+        for image in images:
+            image = transform_functional.adjust_brightness(image, brightness)
+            image = transform_functional.adjust_contrast(image, contrast)
+            image = transform_functional.adjust_saturation(image, saturation)
+            adjusted.append(image)
+        return adjusted
+
+    def _to_tensor(self, image):
+        tensor = transform_functional.to_tensor(image)
+        return transform_functional.normalize(tensor, self.mean, self.std)
+
+    def __call__(self, image):
+        full_image = self.full_preview(image)
+        expression_image = self.expression_preview(image)
+        if self.train:
+            full_image, expression_image = self._augment_pair(
+                full_image,
+                expression_image,
+            )
+        return {
+            "full": self._to_tensor(full_image),
+            "expression": self._to_tensor(expression_image),
+        }
+
+
 def _post_fit_operations(train, mean, std):
     """Build augmentations and tensor normalization after geometric fitting."""
     operations = []
@@ -255,14 +459,7 @@ def build_transform(
     std=IMAGENET_STD,
 ):
     """Build matching train or inference preprocessing."""
-    operations = [
-        FitPad(
-            height=height,
-            width=width,
-            margin=margin,
-            background=background,
-        )
-    ]
+    operations = [build_full_preview(height, width, margin, background)]
     operations.extend(_post_fit_operations(train, mean, std))
     return transforms.Compose(operations)
 
@@ -279,28 +476,82 @@ def build_expression_transform(
 ):
     """Build preprocessing for the focused upper-body expression view."""
     operations = [
-        ForegroundRegionCrop(
+        build_expression_preview(
+            size=size,
             width_fraction=width_fraction,
             height_fraction=height_fraction,
-        ),
-        FitPad(
-            height=size,
-            width=size,
             margin=margin,
             background=background,
-        ),
+        )
     ]
     operations.extend(_post_fit_operations(train, mean, std))
     return transforms.Compose(operations)
 
 
+def build_dual_view_transform(
+    height=512,
+    width=320,
+    expression_size=512,
+    train=False,
+    expression_width_fraction=0.65,
+    expression_height_fraction=0.50,
+    margin=0.04,
+    background=(0, 0, 0),
+    mean=IMAGENET_MEAN,
+    std=IMAGENET_STD,
+):
+    """Build paired preprocessing for training or deterministic evaluation."""
+    return PairedViewTransform(
+        full_preview=build_full_preview(
+            height=height,
+            width=width,
+            margin=margin,
+            background=background,
+        ),
+        expression_preview=build_expression_preview(
+            size=expression_size,
+            width_fraction=expression_width_fraction,
+            height_fraction=expression_height_fraction,
+            margin=margin,
+            background=background,
+        ),
+        train=train,
+        background=background,
+        mean=mean,
+        std=std,
+    )
+
+
 class AtriDataset(Dataset):
     """Dataset for outfit, pose, and expression classification."""
 
-    def __init__(self, records, full_transform, expression_transform):
+    def __init__(
+        self,
+        records,
+        full_transform=None,
+        expression_transform=None,
+        paired_transform=None,
+        task_codes=None,
+    ):
         self.records = list(records)
         self.full_transform = full_transform
         self.expression_transform = expression_transform
+        self.paired_transform = paired_transform
+        task_codes = task_codes or {
+            "outfit": OUTFIT_CODES,
+            "pose": POSE_CODES,
+            "expression": EXPR_CODES,
+        }
+        self.code_to_index = {
+            task: {code: index for index, code in enumerate(codes)}
+            for task, codes in task_codes.items()
+        }
+        if paired_transform is None and (
+            full_transform is None or expression_transform is None
+        ):
+            raise ValueError(
+                "provide paired_transform or both full and expression transforms"
+            )
 
     def __len__(self):
         return len(self.records)
@@ -309,14 +560,16 @@ class AtriDataset(Dataset):
         record = self.records[index]
         with Image.open(record.path) as source:
             image = source.convert("RGBA")
-        views = {
-            "full": self.full_transform(image),
-            "expression": self.expression_transform(image),
-        }
+        if self.paired_transform is not None:
+            views = self.paired_transform(image)
+        else:
+            views = {
+                "full": self.full_transform(image),
+                "expression": self.expression_transform(image),
+            }
 
         targets = {
-            "outfit": OUTFIT_CODES.index(record.outfit),
-            "pose": POSE_CODES.index(record.pose),
-            "expression": EXPR_CODES.index(record.expression),
+            task: self.code_to_index[task][getattr(record, task)]
+            for task in ("outfit", "pose", "expression")
         }
         return views, targets
