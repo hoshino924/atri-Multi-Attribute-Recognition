@@ -1,4 +1,6 @@
-torch
-torchvision
-pillow
-matplotlib
+torch>=2.3,<3
+torchvision>=0.18,<1
+pillow>=10,<13
+matplotlib>=3.7,<4
+numpy>=1.24,<3
+onnx>=1.15,<2
