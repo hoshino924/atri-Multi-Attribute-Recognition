@@ -1,6 +1,6 @@
 # ATRI Multi-Attribute Recognition
 
-[English](readme_en.md) | 中文
+[English](README.md) | 中文 | [日本語](README_JP.md)
 
 基于 PyTorch 的单角色多属性识别项目，用于从 ATRI 角色立绘中同时识别服装、姿势和表情。
 
@@ -333,8 +333,9 @@ python -m unittest discover -s tests
 ├── test_labels.example.csv
 ├── requirements.txt
 ├── LICENSE
-├── readme_en.md
-└── readme.md
+├── README.md             # English（默认）
+├── README_CN.md          # 简体中文
+└── README_JP.md          # 日本語
 ```
 
 `atridataset/` 和 `outputs/` 为本地数据与运行输出目录，不属于程序本体。
