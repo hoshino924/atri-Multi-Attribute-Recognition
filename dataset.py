@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Dataset parsing, splitting, and image transforms."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 import csv
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,17 +9,22 @@ import random
 
 from PIL import Image, ImageOps
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 import torchvision.transforms as transforms
 from torchvision.transforms import functional as transform_functional
 
 from labels import EXPR_CODES, OUTFIT_CODES, POSE_CODES
+from face_regions import FaceCanvas, crop_face, jitter_face_box
+from face_augmentation import FaceAugmentation, augmentation_stat_values, sample_face_offset
+from image_rotation import rotate_image
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 SCALE_CODES = ("s", "w", "m", "l", "ll")
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+DEFAULT_FACE_MIN_SCALE = 0.30
+LEGACY_FACE_MIN_SCALE = 0.55
 
 
 @dataclass(frozen=True)
@@ -90,11 +95,11 @@ def parse_filename(path):
 
 
 def scan_records(root, scale="w"):
-    """Scan a dataset directory and select one resolution level."""
+    """Select one resolution, or require complete matched coverage for all five."""
     root = Path(root)
     if not root.is_dir():
         raise FileNotFoundError(f"dataset directory does not exist: {root}")
-    if scale not in SCALE_CODES:
+    if scale not in (*SCALE_CODES, "all"):
         raise ValueError(f"unknown scale code: {scale}")
 
     records = []
@@ -107,7 +112,7 @@ def scan_records(root, scale="w"):
         except ValueError as exc:
             errors.append(f"{path.name}: {exc}")
             continue
-        if record.scale == scale:
+        if scale == "all" or record.scale == scale:
             records.append(record)
 
     if errors:
@@ -121,14 +126,55 @@ def scan_records(root, scale="w"):
     seen = set()
     duplicates = []
     for record in records:
-        if record.content_key in seen:
+        key = (record.content_key, record.scale)
+        if key in seen:
             duplicates.append(record.path.name)
-        seen.add(record.content_key)
+        seen.add(key)
     if duplicates:
         names = ", ".join(duplicates[:10])
         raise ValueError(f"duplicate content records for scale '{scale}': {names}")
 
+    if scale == "all":
+        content_scale_indices(records, SCALE_CODES)
     return records
+
+
+def content_scale_indices(records, scales):
+    """Index each content/scale once, rejecting incomplete resolution groups."""
+    groups = defaultdict(dict)
+    for index, record in enumerate(records):
+        if record.scale not in scales:
+            raise ValueError(f"unexpected scale: {record.path.name}")
+        group = groups[record.content_key]
+        if record.scale in group:
+            raise ValueError(f"duplicate content/scale: {record.path.name}")
+        group[record.scale] = index
+    if not groups:
+        raise ValueError("no content records")
+    for key, group in groups.items():
+        missing = set(scales) - group.keys()
+        if missing:
+            raise ValueError(f"content {'_'.join(key)} is missing scales: {', '.join(sorted(missing))}")
+    return dict(groups)
+
+
+def split_content_keys(manifest):
+    """Read grouped split identities; resolution variants may share one side."""
+    if not isinstance(manifest, dict):
+        raise ValueError("invalid split manifest")
+    result = {}
+    for name in ("train", "validation"):
+        entries = manifest.get(name)
+        if not isinstance(entries, list) or not entries or not all(isinstance(item, str) for item in entries):
+            raise ValueError(f"invalid {name} split")
+        records = [parse_filename(Path(item.replace("\\", "/")).name) for item in entries]
+        views = [(record.content_key, record.scale) for record in records]
+        if len(set(views)) != len(views):
+            raise ValueError(f"duplicate content/scale in {name} split")
+        result[name] = {record.content_key for record in records}
+    if result["train"] & result["validation"]:
+        raise ValueError("training and validation contain the same artwork")
+    return result
 
 
 def load_label_manifest(root, manifest_path):
@@ -212,18 +258,24 @@ def stratified_split(records, val_ratio=0.25, seed=42):
     """Split by pose and expression while keeping each content item intact."""
     if not 0.0 < val_ratio < 1.0:
         raise ValueError("val_ratio must be between 0 and 1")
-    if len(records) < 2:
-        raise ValueError("at least two records are required for a train/val split")
+    contents = defaultdict(list)
+    for record in records:
+        contents[record.content_key].append(record)
+    if len(contents) < 2:
+        raise ValueError("at least two contents are required for a train/val split")
 
     rng = random.Random(seed)
     strata = defaultdict(list)
-    for record in records:
-        strata[(record.pose, record.expression)].append(record)
+    for key, variants in contents.items():
+        record = variants[0]
+        strata[(record.pose, record.expression)].append(key)
 
     train_records = []
     val_records = []
     for key in sorted(strata):
-        group = sorted(strata[key], key=lambda item: item.path.name)
+        # For a single scale this has the same order as sorting filenames.
+        # Shuffle contents first so adding resolutions cannot change the split.
+        group = sorted(strata[key])
         rng.shuffle(group)
         if len(group) == 1:
             train_records.extend(group)
@@ -240,7 +292,85 @@ def stratified_split(records, val_ratio=0.25, seed=42):
         val_records = [shuffled.pop()]
         train_records = shuffled
 
-    return train_records, val_records
+    def expand(keys):
+        return [record for key in keys for record in sorted(contents[key], key=lambda item: item.path.name)]
+
+    return expand(train_records), expand(val_records)
+
+
+class ContentBalancedSampler(Sampler):
+    """One view per content per epoch; all scales once in every scale cycle.
+
+    Each epoch's scale counts differ by at most one. The remainder rotates, so
+    a complete five-epoch cycle has exactly 20% of each scale. Sampling is a
+    function of seed and absolute epoch, independent of loader/worker RNG.
+    """
+
+    VERSION = 1
+
+    def __init__(self, records, scales=SCALE_CODES, seed=42):
+        self.records = list(records)
+        self.scales = tuple(scales)
+        if not self.scales or len(set(self.scales)) != len(self.scales):
+            raise ValueError("sampling scales must be nonempty and unique")
+        if any(scale not in SCALE_CODES for scale in self.scales):
+            raise ValueError("unknown sampling scale")
+        self.groups = content_scale_indices(self.records, self.scales)
+        self.keys = sorted(self.groups)
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self):
+        return len(self.keys)
+
+    def set_epoch(self, epoch):
+        if not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("sampling epoch must be a nonnegative integer")
+        self.epoch = epoch
+
+    def indices_for_epoch(self, epoch):
+        if not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("sampling epoch must be a nonnegative integer")
+        cycle, phase = divmod(epoch, len(self.scales))
+        slots = list(self.keys)
+        random.Random(self.seed + cycle).shuffle(slots)
+        selected = {
+            key: self.groups[key][self.scales[(index + phase) % len(self.scales)]]
+            for index, key in enumerate(slots)
+        }
+        order = list(self.keys)
+        random.Random(self.seed + epoch).shuffle(order)
+        return [selected[key] for key in order]
+
+    def __iter__(self):
+        return iter(self.indices_for_epoch(self.epoch))
+
+    def metadata(self, batch_size):
+        return {
+            "version": self.VERSION,
+            "mode": "content_then_scale_cycle",
+            "seed": self.seed,
+            "scales": list(self.scales),
+            "scale_weights": {scale: 1.0 / len(self.scales) for scale in self.scales},
+            "cycle_epochs": len(self.scales),
+            "content_count": len(self),
+            "samples_per_epoch": len(self),
+            "batches_per_epoch": (len(self) + batch_size - 1) // batch_size,
+            "drop_last": False,
+            "angle": 0,
+        }
+
+    def epoch_summary(self, epoch, include_filenames=False):
+        selected = [self.records[index] for index in self.indices_for_epoch(epoch)]
+        counts = Counter(record.scale for record in selected)
+        summary = {
+            "epoch": epoch + 1,
+            "samples": len(selected),
+            "scale_counts": {scale: counts[scale] for scale in self.scales},
+        }
+        if include_filenames:
+            summary["filenames"] = [record.path.name for record in selected]
+        return summary
 
 
 class FitPad:
@@ -289,8 +419,10 @@ class ForegroundRegionCrop:
         self.width_fraction = width_fraction
         self.height_fraction = height_fraction
 
-    def __call__(self, image):
-        image = image.convert("RGBA")
+    def bounds(self, image):
+        """Return the original-image PIL rectangle used by the legacy crop."""
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
         foreground = image.getchannel("A").getbbox()
         if foreground is None:
             foreground = (0, 0, image.width, image.height)
@@ -306,7 +438,11 @@ class ForegroundRegionCrop:
         crop_right = min(right, crop_left + crop_width)
         crop_left = max(left, crop_right - crop_width)
         crop_bottom = min(bottom, top + crop_height)
-        return image.crop((crop_left, top, crop_right, crop_bottom))
+        return crop_left, top, crop_right, crop_bottom
+
+    def __call__(self, image):
+        image = image.convert("RGBA")
+        return image.crop(self.bounds(image))
 
 
 def build_full_preview(
@@ -347,7 +483,7 @@ def build_expression_preview(
 
 
 class PairedViewTransform:
-    """Create both views while sharing all randomly sampled augmentations."""
+    """Share appearance/orientation parameters; control face-crop shifts separately."""
 
     def __init__(
         self,
@@ -357,51 +493,67 @@ class PairedViewTransform:
         background=(0, 0, 0),
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
+        face_min_scale=DEFAULT_FACE_MIN_SCALE,
+        augmentation=None,
+        collect_augmentation=False,
     ):
+        if not 0.0 < face_min_scale <= 1.0:
+            raise ValueError("face_min_scale must be in (0, 1]")
         self.full_preview = full_preview
         self.expression_preview = expression_preview
         self.train = train
         self.background = tuple(background)
         self.mean = tuple(mean)
         self.std = tuple(std)
+        self.face_min_scale = face_min_scale
+        self.augmentation = augmentation or FaceAugmentation(min_scale=face_min_scale)
+        self.collect_augmentation = collect_augmentation
 
     @staticmethod
     def _uniform(low, high):
         return torch.empty(1).uniform_(low, high).item()
 
-    def _augment_pair(self, full_image, expression_image):
+    def _sample_pair_parameters(self):
+        policy = self.augmentation
+        return {
+            "flip": torch.rand(1).item() < policy.flip_probability,
+            "angle": self._uniform(-policy.affine_degrees, policy.affine_degrees),
+            "translate_x": self._uniform(-1.0, 1.0),
+            "translate_y": self._uniform(-1.0, 1.0),
+            "scale": self._uniform(policy.affine_scale_min, policy.affine_scale_max),
+            "brightness": self._uniform(1 - policy.color_jitter, 1 + policy.color_jitter),
+            "contrast": self._uniform(1 - policy.color_jitter, 1 + policy.color_jitter),
+            "saturation": self._uniform(1 - policy.color_jitter, 1 + policy.color_jitter),
+        }
+
+    def _augment_pair(self, full_image, expression_image, parameters=None):
+        parameters = parameters or self._sample_pair_parameters()
         images = [full_image, expression_image]
-        if torch.rand(1).item() < 0.5:
+        if parameters["flip"]:
             images = [transform_functional.hflip(image) for image in images]
 
-        angle = self._uniform(-3.0, 3.0)
-        translate_x = self._uniform(-0.02, 0.02)
-        translate_y = self._uniform(-0.02, 0.02)
-        scale = self._uniform(0.95, 1.02)
+        policy = self.augmentation
         images = [
             transform_functional.affine(
                 image,
-                angle=angle,
+                angle=parameters["angle"],
                 translate=[
-                    round(translate_x * image.width),
-                    round(translate_y * image.height),
+                    round(parameters["translate_x"] * fraction * image.width),
+                    round(parameters["translate_y"] * fraction * image.height),
                 ],
-                scale=scale,
+                scale=parameters["scale"],
                 shear=[0.0, 0.0],
                 interpolation=transforms.InterpolationMode.BILINEAR,
                 fill=self.background,
             )
-            for image in images
+            for image, fraction in zip(images, (policy.full_translate, policy.face_translate))
         ]
 
-        brightness = self._uniform(0.92, 1.08)
-        contrast = self._uniform(0.92, 1.08)
-        saturation = self._uniform(0.92, 1.08)
         adjusted = []
         for image in images:
-            image = transform_functional.adjust_brightness(image, brightness)
-            image = transform_functional.adjust_contrast(image, contrast)
-            image = transform_functional.adjust_saturation(image, saturation)
+            image = transform_functional.adjust_brightness(image, parameters["brightness"])
+            image = transform_functional.adjust_contrast(image, parameters["contrast"])
+            image = transform_functional.adjust_saturation(image, parameters["saturation"])
             adjusted.append(image)
         return adjusted
 
@@ -409,18 +561,73 @@ class PairedViewTransform:
         tensor = transform_functional.to_tensor(image)
         return transform_functional.normalize(tensor, self.mean, self.std)
 
-    def __call__(self, image):
+    def render(self, image, face_box=None):
+        """Return the actual pre-normalization inputs and auditable crop metadata."""
+        info = {}
+        parameters = self._sample_pair_parameters() if self.train else None
         full_image = self.full_preview(image)
-        expression_image = self.expression_preview(image)
+        if isinstance(self.expression_preview, FaceCanvas):
+            if face_box is None:
+                raise ValueError("annotated face preprocessing requires a face box")
+            if not face_box.fits(*image.size):
+                raise ValueError("face box is outside the image")
+            original_box = face_box
+            policy = self.augmentation
+            if self.train:
+                if policy.position_mode == "legacy":
+                    face_box = jitter_face_box(face_box, *image.size, random, policy.size_jitter)
+                    anchor = original_box.resized(face_box.side - original_box.side, *image.size)
+                else:
+                    face_box = face_box.resized(round(face_box.side * random.uniform(
+                        -policy.size_jitter, policy.size_jitter)), *image.size)
+                    anchor = face_box
+            else:
+                anchor = face_box
+            side = face_box.side
+            if self.train and random.random() < policy.shrink_probability:
+                side = max(1, round(side * random.uniform(policy.min_scale, 1.0)))
+            rendered_side = min(side, self.expression_preview.size)
+            # Account for actual rounded shrink size and the later affine scale.
+            # Offset axes are defined before the shared flip/rotation, so that
+            # these orientation transforms do not change the sampled strength.
+            output_scale = rendered_side / face_box.side * (parameters["scale"] if self.train else 1.0)
+            if self.train and policy.position_mode != "legacy":
+                face_box, info = sample_face_offset(face_box, image.size, output_scale, policy, random)
+            else:
+                dx, dy = face_box.x_left - anchor.x_left, face_box.y_bottom - anchor.y_bottom
+                info = {"bucket": "legacy" if self.train else "keep", "rejected_attempts": 0,
+                        "fallback": False, "source_dx": dx, "source_dy": dy,
+                        "requested_dx": dx * output_scale, "requested_dy": dy * output_scale,
+                        "actual_dx": dx * output_scale, "actual_dy": dy * output_scale,
+                        "output_scale": output_scale}
+            info.update(original_x=original_box.x_left, original_y=original_box.y_bottom,
+                        original_side=original_box.side, anchor_x=anchor.x_left, anchor_y=anchor.y_bottom,
+                        x_left=face_box.x_left, y_bottom=face_box.y_bottom, side=face_box.side,
+                        resized_side=side, rendered_side=rendered_side, shrunk=side < face_box.side,
+                        affine=parameters)
+            face_image = crop_face(image, face_box)
+            if side != face_box.side:
+                face_image = face_image.resize((side, side), Image.Resampling.LANCZOS)
+            expression_image = self.expression_preview(face_image)
+        else:
+            expression_image = self.expression_preview(image)
         if self.train:
             full_image, expression_image = self._augment_pair(
                 full_image,
                 expression_image,
+                parameters,
             )
-        return {
+        return full_image, expression_image, info
+
+    def __call__(self, image, face_box=None):
+        full_image, expression_image, info = self.render(image, face_box)
+        views = {
             "full": self._to_tensor(full_image),
             "expression": self._to_tensor(expression_image),
         }
+        if self.train and self.collect_augmentation and info:
+            views["_face_augmentation"] = torch.tensor(augmentation_stat_values(info), dtype=torch.float64)
+        return views
 
 
 def _post_fit_operations(train, mean, std):
@@ -499,6 +706,10 @@ def build_dual_view_transform(
     background=(0, 0, 0),
     mean=IMAGENET_MEAN,
     std=IMAGENET_STD,
+    face_crop=False,
+    face_min_scale=DEFAULT_FACE_MIN_SCALE,
+    augmentation=None,
+    collect_augmentation=False,
 ):
     """Build paired preprocessing for training or deterministic evaluation."""
     return PairedViewTransform(
@@ -508,7 +719,7 @@ def build_dual_view_transform(
             margin=margin,
             background=background,
         ),
-        expression_preview=build_expression_preview(
+        expression_preview=FaceCanvas(expression_size, background) if face_crop else build_expression_preview(
             size=expression_size,
             width_fraction=expression_width_fraction,
             height_fraction=expression_height_fraction,
@@ -519,7 +730,21 @@ def build_dual_view_transform(
         background=background,
         mean=mean,
         std=std,
+        face_min_scale=face_min_scale,
+        augmentation=augmentation,
+        collect_augmentation=collect_augmentation,
     )
+
+
+def open_record_image(record):
+    """Decode once and rotate the source canvas before either classifier view."""
+    with Image.open(record.path) as source:
+        image = source.convert("RGBA")
+    return rotate_image(image, record.angle) if hasattr(record, "angle") else image
+
+
+def record_box_key(record):
+    return (record.path.name, record.angle) if hasattr(record, "angle") else record.path.name
 
 
 class AtriDataset(Dataset):
@@ -532,11 +757,17 @@ class AtriDataset(Dataset):
         expression_transform=None,
         paired_transform=None,
         task_codes=None,
+        face_boxes=None,
+        view_metadata=False,
+        angle_weights=None,
     ):
         self.records = list(records)
         self.full_transform = full_transform
         self.expression_transform = expression_transform
         self.paired_transform = paired_transform
+        self.face_boxes = face_boxes
+        self.view_metadata = view_metadata
+        self.angle_weights = angle_weights
         task_codes = task_codes or {
             "outfit": OUTFIT_CODES,
             "pose": POSE_CODES,
@@ -558,16 +789,25 @@ class AtriDataset(Dataset):
 
     def __getitem__(self, index):
         record = self.records[index]
-        with Image.open(record.path) as source:
-            image = source.convert("RGBA")
+        image = open_record_image(record)
         if self.paired_transform is not None:
-            views = self.paired_transform(image)
+            views = (
+                self.paired_transform(image, self.face_boxes[record_box_key(record)])
+                if self.face_boxes is not None else self.paired_transform(image)
+            )
         else:
             views = {
                 "full": self.full_transform(image),
-                "expression": self.expression_transform(image),
+                "expression": (
+                    self.expression_transform(image, self.face_boxes[record_box_key(record)])
+                    if self.face_boxes is not None else self.expression_transform(image)
+                ),
             }
 
+        if self.view_metadata:
+            views["_view"] = torch.tensor([SCALE_CODES.index(record.scale), record.angle], dtype=torch.float64)
+        if self.angle_weights is not None:
+            views["_sample_weight"] = torch.tensor(self.angle_weights[record.angle], dtype=torch.float64)
         targets = {
             task: self.code_to_index[task][getattr(record, task)]
             for task in ("outfit", "pose", "expression")

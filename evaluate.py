@@ -26,6 +26,9 @@ from dataset import (
 )
 from infer import load_model
 from labels import TASK_CODES
+from face_locator import FaceNotFoundError
+from face_regions import load_face_annotations
+from PIL import Image
 
 
 TASKS = tuple(TASK_CODES.keys())
@@ -76,18 +79,21 @@ def confusion_matrix(targets, predictions, class_count):
     ).reshape(class_count, class_count)
 
 
-def task_metrics(logits, targets, threshold):
+def task_metrics(logits, targets, threshold, available=None):
     """Calculate full-set and accepted-subset metrics for one task."""
     probabilities = torch.softmax(logits, dim=1)
     confidence, predictions = probabilities.max(dim=1)
+    if available is None:
+        available = torch.ones_like(confidence, dtype=torch.bool)
     accepted = (
         torch.ones_like(confidence, dtype=torch.bool)
         if threshold is None
         else confidence.ge(threshold)
     )
-    correct = predictions.eq(targets)
-    matrix = confusion_matrix(targets, predictions, logits.shape[1])
-    support = matrix.sum(dim=1)
+    accepted &= available
+    correct = predictions.eq(targets) & available
+    matrix = confusion_matrix(targets[available], predictions[available], logits.shape[1])
+    support = torch.bincount(targets, minlength=logits.shape[1])
     true_positive = matrix.diag()
     predicted = matrix.sum(dim=0)
     precision = true_positive / predicted.clamp_min(1)
@@ -98,8 +104,10 @@ def task_metrics(logits, targets, threshold):
     return {
         "accuracy": correct.float().mean().item(),
         "macro_f1": f1[included].mean().item() if included.any() else None,
-        "nll": functional.cross_entropy(logits, targets).item(),
-        "ece": expected_calibration_error(logits, targets),
+        "nll": functional.cross_entropy(logits[available], targets[available]).item() if available.any() else None,
+        "ece": expected_calibration_error(logits[available], targets[available]) if available.any() else None,
+        "localization_coverage": available.float().mean().item(),
+        "missing_predictions": (~available).sum().item(),
         "coverage": accepted.float().mean().item(),
         "selective_accuracy": (
             correct[accepted].float().mean().item()
@@ -114,8 +122,8 @@ def task_metrics(logits, targets, threshold):
             else None
             for index in range(len(support))
         ],
-        "predictions": predictions.tolist(),
-        "confidence": confidence.tolist(),
+        "predictions": predictions.masked_fill(~available, -1).tolist(),
+        "confidence": confidence.masked_fill(~available, 0).tolist(),
         "accepted": accepted.tolist(),
         "correct": correct.tolist(),
     }
@@ -157,13 +165,34 @@ def evaluate(args):
         if torch.cuda.is_available() and not args.cpu
         else "cpu"
     )
-    model, image_transforms, label_codes = load_model(args.weight, device)
+    model, image_transforms, label_codes = load_model(args.weight, device, args.locator_weight, args.locator_threshold)
     records = load_evaluation_records(args.test_dir, args.labels)
+    face_boxes, localization_errors = None, {}
+    if hasattr(model, "face_preview"):
+        if args.face_annotations:
+            face_boxes = load_face_annotations(records, args.face_annotations)
+        else:
+            if model.face_preview.locator is None:
+                raise ValueError("face-crop evaluation requires --locator_weight or --face_annotations")
+            face_boxes = {}
+            for record in records:
+                with Image.open(record.path) as source:
+                    try:
+                        face_boxes[record.path.name], _ = model.face_preview.locator.locate(source)
+                    except FaceNotFoundError as exc:
+                        localization_errors[record.path.name] = str(exc)
+        # Resolve all GPU localization in the main process before worker loading.
+        model.face_preview.locator = None
+    elif args.face_annotations:
+        raise ValueError("--face_annotations requires a face-crop classifier checkpoint")
+    available = torch.tensor([r.path.name not in localization_errors for r in records], dtype=torch.bool)
+    selected_records = [r for r in records if r.path.name not in localization_errors]
     dataset = AtriDataset(
-        records,
+        selected_records,
         full_transform=image_transforms["full"],
         expression_transform=image_transforms["expression"],
         task_codes=label_codes,
+        face_boxes=face_boxes,
     )
     loader_options = {
         "batch_size": args.batch,
@@ -176,7 +205,6 @@ def evaluate(args):
     loader = DataLoader(dataset, **loader_options)
 
     all_logits = {task: [] for task in TASKS}
-    all_targets = {task: [] for task in TASKS}
     amp_enabled = device.type == "cuda" and not args.no_amp
     with torch.inference_mode():
         for views, targets in loader:
@@ -197,12 +225,13 @@ def evaluate(args):
                     model.calibration,
                 )
                 all_logits[task].append(logits.detach().float().cpu())
-                all_targets[task].append(targets[task].long().cpu())
 
     metrics = {}
     for task in TASKS:
-        logits = torch.cat(all_logits[task])
-        targets = torch.cat(all_targets[task])
+        logits = torch.zeros(len(records), len(label_codes[task]))
+        if all_logits[task]:
+            logits[available] = torch.cat(all_logits[task])
+        targets = torch.tensor([label_codes[task].index(getattr(record, task)) for record in records])
         threshold = None
         if not args.accept_all:
             threshold = (
@@ -210,7 +239,7 @@ def evaluate(args):
                 if args.min_confidence is not None
                 else suggested_threshold(task, model.calibration)
             )
-        task_result = task_metrics(logits, targets, threshold)
+        task_result = task_metrics(logits, targets, threshold, available)
         task_result["threshold"] = threshold
         task_result["support_by_code"] = {
             code: task_result["support"][index]
@@ -243,6 +272,9 @@ def evaluate(args):
         "test_dir": str(args.test_dir),
         "labels": str(args.labels) if args.labels else None,
         "samples": sample_count,
+        "crop_source": "annotations" if args.face_annotations else ("locator" if face_boxes is not None else "legacy_foreground"),
+        "locator_checkpoint": args.locator_weight,
+        "localization_failures": localization_errors,
         "joint_accuracy": sum(joint_correct) / sample_count,
         "joint_coverage": sum(joint_accepted) / sample_count,
         "joint_selective_accuracy": (
@@ -272,7 +304,7 @@ def evaluate(args):
         encoding="utf-8",
         newline="",
     ) as stream:
-        fieldnames = ["filename"]
+        fieldnames = ["filename", "localization_error"]
         for task in TASKS:
             fieldnames.extend([
                 f"{task}_actual",
@@ -283,13 +315,13 @@ def evaluate(args):
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         for index, record in enumerate(records):
-            row = {"filename": record.path.name}
+            row = {"filename": record.path.name, "localization_error": localization_errors.get(record.path.name, "")}
             for task in TASKS:
                 actual = getattr(record, task)
                 predicted_index = metrics[task]["predictions"][index]
                 row.update({
                     f"{task}_actual": actual,
-                    f"{task}_predicted": label_codes[task][predicted_index],
+                    f"{task}_predicted": label_codes[task][predicted_index] if predicted_index >= 0 else "",
                     f"{task}_confidence": metrics[task]["confidence"][index],
                     f"{task}_accepted": metrics[task]["accepted"][index],
                 })
@@ -310,7 +342,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate a checkpoint on an independent labeled set."
     )
-    parser.add_argument("--weight", default="outputs/atri_net_best.pth")
+    from app_assets import DEFAULT_CLASSIFIER_WEIGHT, DEFAULT_LOCATOR_WEIGHT
+    parser.add_argument("--weight", default=DEFAULT_CLASSIFIER_WEIGHT)
+    parser.add_argument("--locator_weight", default=DEFAULT_LOCATOR_WEIGHT)
+    parser.add_argument("--locator_threshold", type=float)
+    parser.add_argument("--face_annotations", help="optional ground-truth crops; isolates classifier quality")
     parser.add_argument("--test_dir", default="atridataset/test")
     parser.add_argument("--labels", help="CSV with filename,outfit,pose,expression")
     parser.add_argument("--output_dir", default="evaluation")

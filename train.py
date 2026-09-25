@@ -21,6 +21,9 @@ import torchvision
 from calibration import build_calibration, collect_logits
 from dataset import (
     AtriDataset,
+    ContentBalancedSampler,
+    DEFAULT_FACE_MIN_SCALE,
+    LEGACY_FACE_MIN_SCALE,
     IMAGENET_MEAN,
     IMAGENET_STD,
     SCALE_CODES,
@@ -29,7 +32,15 @@ from dataset import (
     stratified_split,
 )
 from labels import TASK_CODES
-from model import AtriNet
+from model import AtriNet, EXPRESSION_HEADS, checkpoint_expression_head
+from face_box_cache import load_face_cache
+from face_regions import FACE_CROP_MODE, annotation_signature, load_face_annotations
+from face_augmentation import FaceAugmentation, summarize_augmentation
+from preview_augmentation import save_augmentation_previews
+from classifier_rotation import ContentScaleAngleSampler, GroupedMetrics, validation_selection
+from rotation_data import angle_policy, rotation_records
+from image_rotation import ROTATION_CONTRACT
+from PIL import __version__ as PILLOW_VERSION
 
 
 TASKS = tuple(TASK_CODES.keys())
@@ -38,6 +49,9 @@ PROTECTED_OUTPUT_NAMES = {
     "atri_net_best.pth",
     "atri_net_last.pth",
     "metrics.json",
+    "augmentation_previews",
+    "augmentation_preview.json",
+    "sampling_preview.json",
 }
 
 
@@ -116,7 +130,8 @@ def save_run_metadata(out_dir, args, device):
 
 def print_record_summary(name, records):
     """Print label counts for one dataset split."""
-    print(f"{name}: {len(records)} images")
+    print(f"{name}: {len(records)} views / {len({r.path.name for r in records})} source images / {len({r.content_key for r in records})} contents")
+    print("  scales:", dict(Counter(record.scale for record in records)))
     for task in TASKS:
         counts = Counter(getattr(record, task) for record in records)
         detail = ", ".join(
@@ -138,19 +153,26 @@ def save_split_manifest(
     root = os.path.abspath(root)
 
     def relative_names(records):
-        return [
+        return list(dict.fromkeys(
             os.path.relpath(os.path.abspath(record.path), root)
             for record in records
-        ]
+        ))
 
     manifest = {
         "seed": args.seed,
         "val_ratio": args.val_ratio,
         "scale": args.scale,
         "dataset_signature": data_signature,
+        "grouping": "character_shoe_variant_outfit_pose_expression",
+        "content_counts": {
+            "train": len({record.content_key for record in train_records}),
+            "validation": len({record.content_key for record in val_records}),
+        },
         "train": relative_names(train_records),
         "validation": relative_names(val_records),
     }
+    if getattr(args, "rotation_policy", None):
+        manifest["rotation_policy"] = args.rotation_policy
     save_json(path, manifest)
 
 
@@ -191,6 +213,8 @@ def run_epoch(
         model.freeze_backbone_batchnorm()
 
     sample_count = 0
+    optimizer_steps = 0
+    skipped_optimizer_steps = 0
     total_loss = 0.0
     task_loss_totals = {task: 0.0 for task in TASKS}
     task_correct = {task: 0 for task in TASKS}
@@ -200,8 +224,14 @@ def run_epoch(
         (expression_classes, expression_classes),
         dtype=torch.long,
     )
+    augmentation_rows = []
+    grouped = GroupedMetrics(TASKS)
 
     for views, targets in loader:
+        if "_face_augmentation" in views:
+            augmentation_rows.extend(views.pop("_face_augmentation").tolist())
+        identities = views.pop("_view", None)
+        views.pop("_sample_weight", None)
         views = move_views(views, device)
         targets = move_targets(targets, device)
         batch_size = views["full"].size(0)
@@ -226,8 +256,13 @@ def run_epoch(
                 if gradient_clip > 0.0:
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                previous_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                if scaler.get_scale() < previous_scale:
+                    skipped_optimizer_steps += 1
+                else:
+                    optimizer_steps += 1
 
         sample_count += batch_size
         total_loss += loss.item() * batch_size
@@ -248,6 +283,7 @@ def run_epoch(
                     minlength=expression_classes * expression_classes,
                 ).reshape(expression_classes, expression_classes)
         joint_correct += batch_joint.sum().item()
+        grouped.add(identities, outputs, targets, getattr(loss_fn, "label_smoothing", 0.0))
 
     if sample_count == 0:
         raise RuntimeError("the data loader produced no samples")
@@ -263,6 +299,9 @@ def run_epoch(
         )
 
     return {
+        "samples": sample_count,
+        "optimizer_steps": optimizer_steps,
+        "skipped_optimizer_steps": skipped_optimizer_steps,
         "loss": total_loss / sample_count,
         "task_loss": {
             task: task_loss_totals[task] / sample_count
@@ -275,6 +314,8 @@ def run_epoch(
         "joint_accuracy": joint_correct / sample_count,
         "expression_class_accuracy": expression_class_accuracy,
         "expression_confusion": expression_confusion.tolist(),
+        "face_augmentation": summarize_augmentation(augmentation_rows),
+        "by_angle_scale": grouped.summary(),
     }
 
 
@@ -290,6 +331,64 @@ def format_metrics(name, metrics):
     )
 
 
+def face_box_source(args):
+    if getattr(args, "face_cache", None):
+        return "locator_cache"
+    return "manual_annotations" if args.face_annotations else None
+
+
+def expression_preprocess(args):
+    if face_box_source(args):
+        return {"mode": FACE_CROP_MODE, "size": args.expression_size,
+                "margin": 0.0, "allow_upscale": False,
+                "coordinate_system": "bottom_left_pixels"}
+    return {"size": args.expression_size, "width_fraction": args.expression_width_fraction,
+            "height_fraction": args.expression_height_fraction, "margin": args.margin}
+
+
+def resolve_face_min_scale(args, checkpoint=None):
+    """Use the new range for new runs; preserve old augmentation on resume."""
+    if args.face_min_scale is None:
+        args.face_min_scale = (
+            checkpoint.get("train_args", {}).get("face_min_scale", LEGACY_FACE_MIN_SCALE)
+            if checkpoint is not None else DEFAULT_FACE_MIN_SCALE
+        )
+    if not 0.0 < args.face_min_scale <= 1.0:
+        raise ValueError("--face_min_scale must be in (0, 1]")
+
+
+AUGMENTATION_ARGUMENTS = {
+    "position_mode": "face_jitter", "size_jitter": "face_size_jitter",
+    "shrink_probability": "face_shrink_probability", "keep_probability": "face_keep_probability",
+    "small_probability": "face_small_probability", "small_pixels": "face_small_pixels",
+    "wide_pixels": "face_wide_pixels", "attempts": "face_jitter_attempts",
+    "face_translate": "face_translate", "full_translate": "full_translate",
+    "flip_probability": "flip_probability", "affine_degrees": "affine_degrees",
+    "affine_scale_min": "affine_scale_min", "affine_scale_max": "affine_scale_max",
+    "color_jitter": "color_jitter",
+}
+
+
+def resolve_augmentation(args, checkpoint=None):
+    """New face runs use mixed jitter; resumes inherit the recorded policy."""
+    saved = (checkpoint or {}).get("train_args", {}).get("augmentation_config")
+    defaults = (FaceAugmentation.from_metadata(saved) if saved else FaceAugmentation()).metadata()
+    if checkpoint is None and face_box_source(args):
+        defaults.update(position_mode="mixed", face_translate=0.0)
+    values = {key: getattr(args, arg, None) if getattr(args, arg, None) is not None else defaults[key]
+              for key, arg in AUGMENTATION_ARGUMENTS.items()}
+    if getattr(args, "face_translate", None) is None and not saved:
+        values["face_translate"] = 0.02 if values["position_mode"] == "legacy" else 0.0
+    values["min_scale"] = args.face_min_scale
+    policy = FaceAugmentation(**values)
+    if not face_box_source(args) and policy.position_mode != "legacy":
+        raise ValueError("mixed/none face jitter requires --face_cache or --face_annotations")
+    for key, arg in AUGMENTATION_ARGUMENTS.items():
+        setattr(args, arg, values[key])
+    args.augmentation_config = policy.metadata()
+    return policy
+
+
 def make_checkpoint(
     model,
     args,
@@ -300,15 +399,26 @@ def make_checkpoint(
     data_signature=None,
 ):
     """Create the inference-compatible part of a checkpoint."""
+    expression_head = getattr(args, "expression_head", "fusion")
+    if getattr(model, "expression_head", expression_head) != expression_head:
+        raise ValueError("model expression head disagrees with training configuration")
     return {
-        "format_version": CHECKPOINT_VERSION,
+        "format_version": 4 if face_box_source(args) else CHECKPOINT_VERSION,
         "model_state": model.state_dict(),
         "epoch": epoch,
         "best_expression_loss": best_expression_loss,
+        # Legacy state key above is also used by restore_training_state.
+        # For D2 its value is the explicitly declared three-task criterion.
+        "best_selection_loss": best_expression_loss,
         "dataset_signature": data_signature,
+        "face_box_source": face_box_source(args),
+        "face_cache_metadata": getattr(args, "face_cache_metadata", None),
+        "rotation_training": getattr(args, "rotation_policy", None),
+        "selection_metric": getattr(args, "selection_metric", "expression_cross_entropy"),
         "model_config": {
             "backbone": "resnet18",
             "architecture": "dual_view_shared_backbone",
+            "expression_head": expression_head,
             "dropout": args.dropout,
             "task_sizes": {
                 task: len(codes)
@@ -322,12 +432,7 @@ def make_checkpoint(
                 "width": args.width,
                 "margin": args.margin,
             },
-            "expression": {
-                "size": args.expression_size,
-                "width_fraction": args.expression_width_fraction,
-                "height_fraction": args.expression_height_fraction,
-                "margin": args.margin,
-            },
+            "expression": expression_preprocess(args),
             "background": [0, 0, 0],
             "normalization": {
                 "mean": list(IMAGENET_MEAN),
@@ -354,8 +459,12 @@ def load_torch_checkpoint(path, device):
 
 def validate_resume_config(checkpoint, args, data_signature):
     """Reject a resume checkpoint built with incompatible data settings."""
-    if checkpoint.get("format_version") != CHECKPOINT_VERSION:
+    expected_version = 4 if face_box_source(args) else CHECKPOINT_VERSION
+    if checkpoint.get("format_version") != expected_version:
         raise ValueError("resume checkpoint format is not compatible")
+    saved_source = checkpoint.get("face_box_source", "manual_annotations" if expected_version == 4 else None)
+    if saved_source != face_box_source(args):
+        raise ValueError("resume face box source differs; start a new run to switch manual / automatic boxes")
     if checkpoint.get("label_codes") != TASK_CODES:
         raise ValueError("resume checkpoint label definitions do not match")
     checkpoint_signature = checkpoint.get("dataset_signature")
@@ -365,6 +474,8 @@ def validate_resume_config(checkpoint, args, data_signature):
         )
 
     model_config = checkpoint.get("model_config", {})
+    if checkpoint_expression_head(checkpoint) != getattr(args, "expression_head", "fusion"):
+        raise ValueError("resume expression head differs; start a new run to change architecture")
     if model_config.get("dropout") != args.dropout:
         raise ValueError("resume checkpoint dropout does not match --dropout")
 
@@ -374,12 +485,7 @@ def validate_resume_config(checkpoint, args, data_signature):
         "width": args.width,
         "margin": args.margin,
     }
-    expression_expected = {
-        "size": args.expression_size,
-        "width_fraction": args.expression_width_fraction,
-        "height_fraction": args.expression_height_fraction,
-        "margin": args.margin,
-    }
+    expression_expected = expression_preprocess(args)
     mismatched = []
     if preprocess.get("scale") != args.scale:
         mismatched.append("scale")
@@ -396,6 +502,42 @@ def validate_resume_config(checkpoint, args, data_signature):
     if mismatched:
         names = ", ".join(mismatched)
         raise ValueError(f"resume checkpoint settings differ: {names}")
+    saved_args = checkpoint.get("train_args", {})
+    if saved_args.get("rotation_policy") != getattr(args, "rotation_policy", None):
+        raise ValueError("resume rotation policy differs; start a new run")
+    if saved_args.get("selection_metric", "expression_cross_entropy") != getattr(args, "selection_metric", "expression_cross_entropy"):
+        raise ValueError("resume model-selection rule differs; start a new run")
+    current_augmentation = getattr(args, "augmentation_config", None)
+    saved_augmentation = saved_args.get("augmentation_config")
+    if current_augmentation is not None or saved_augmentation is not None:
+        if saved_augmentation is None:
+            saved_augmentation = FaceAugmentation(
+                min_scale=saved_args.get("face_min_scale", LEGACY_FACE_MIN_SCALE),
+            ).metadata()
+        if current_augmentation != saved_augmentation:
+            raise ValueError("resume augmentation policy differs; start a new run without --resume")
+    sampling = getattr(args, "sampling_metadata", None)
+    if saved_args.get("sampling_metadata") != sampling:
+        raise ValueError("resume sampling policy or sample budget differs; start a new run")
+    if sampling is not None:
+        # A scheduler restored under a different epoch/batch budget is not the
+        # same experiment, even when the model and input sizes are unchanged.
+        for key in ("batch", "epochs", "warmup_epochs", "seed", "val_ratio",
+                    "lr_backbone", "lr_heads", "min_lr", "weight_decay",
+                    "label_smoothing", "gradient_clip", "train_bn", "no_amp",
+                    "patience", "threshold_quantile"):
+            if saved_args.get(key) != getattr(args, key):
+                raise ValueError(f"resume training setting differs: {key}; start a new run")
+    if face_box_source(args):
+        for key in ("seed", "val_ratio"):
+            if checkpoint.get("train_args", {}).get(key) != getattr(args, key):
+                raise ValueError(f"resume split setting differs: {key}")
+        saved_scale = checkpoint.get("train_args", {}).get("face_min_scale", LEGACY_FACE_MIN_SCALE)
+        if saved_scale != getattr(args, "face_min_scale", LEGACY_FACE_MIN_SCALE):
+            raise ValueError(
+                "resume face augmentation differs: face_min_scale; "
+                "start a new run without --resume to change it"
+            )
 
 
 def restore_training_state(
@@ -486,6 +628,11 @@ def save_metrics(history, out_dir):
         "joint_accuracy",
         "backbone_lr",
         "heads_lr",
+        "samples",
+        "optimizer_steps",
+        "skipped_optimizer_steps",
+        "cumulative_optimizer_steps",
+        *[f"samples_{scale}" for scale in SCALE_CODES],
     ]
     with open(
         os.path.join(out_dir, "metrics.csv"),
@@ -512,6 +659,12 @@ def save_metrics(history, out_dir):
                     "joint_accuracy": metrics["joint_accuracy"],
                     "backbone_lr": learning_rates.get("backbone"),
                     "heads_lr": learning_rates.get("heads"),
+                    "samples": metrics.get("samples"),
+                    "optimizer_steps": metrics.get("optimizer_steps"),
+                    "skipped_optimizer_steps": metrics.get("skipped_optimizer_steps"),
+                    "cumulative_optimizer_steps": item.get("cumulative_optimizer_steps"),
+                    **{f"samples_{scale}": metrics.get("scale_counts", {}).get(scale, 0)
+                       for scale in SCALE_CODES},
                 })
 
 
@@ -552,6 +705,19 @@ def save_expression_report(metrics, out_dir):
 
 def validate_args(args):
     """Validate command-line values before loading data or allocating a model."""
+    args.expression_head = getattr(args, "expression_head", "fusion")
+    if args.expression_head not in EXPRESSION_HEADS:
+        raise ValueError("--expression_head must be fusion or face_only")
+    if args.face_annotations and getattr(args, "face_cache", None):
+        raise ValueError("--face_annotations and --face_cache are mutually exclusive")
+    if getattr(args, "angle_weights", None) is not None and getattr(args, "angles", None) is None:
+        raise ValueError("--angle_weights requires --angles")
+    if getattr(args, "angles", None) is not None and not getattr(args, "face_cache", None):
+        raise ValueError("classifier --angles requires --face_cache")
+    if args.scale is None:
+        args.scale = "l" if args.face_annotations else "w"
+    if args.expression_size is None:
+        args.expression_size = 300 if getattr(args, "face_cache", None) else (626 if args.face_annotations else 512)
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.batch <= 0:
@@ -560,6 +726,8 @@ def validate_args(args):
         raise ValueError("--height and --width must be positive")
     if args.expression_size <= 0:
         raise ValueError("--expression_size must be positive")
+    if args.face_min_scale is not None and not 0.0 < args.face_min_scale <= 1.0:
+        raise ValueError("--face_min_scale must be in (0, 1]")
     if not 0.0 < args.expression_width_fraction <= 1.0:
         raise ValueError("--expression_width_fraction must be in (0, 1]")
     if not 0.0 < args.expression_height_fraction <= 1.0:
@@ -580,13 +748,19 @@ def validate_args(args):
         raise ValueError("--gradient_clip cannot be negative")
     if not 0.0 <= args.threshold_quantile <= 0.5:
         raise ValueError("--threshold_quantile must be in [0, 0.5]")
+    if getattr(args, "augmentation_preview_only", False):
+        if not face_box_source(args):
+            raise ValueError("augmentation preview requires face boxes")
+        if args.resume:
+            raise ValueError("augmentation preview requires a new run directory without --resume")
+    if getattr(args, "augmentation_preview_count", 21) < 1 or getattr(args, "augmentation_preview_repeats", 4) < 1:
+        raise ValueError("augmentation preview count and repeats must be positive")
 
 
 def train(args):
     """Run the complete training and validation workflow."""
     validate_args(args)
     seed_everything(args.seed)
-    args.out_dir = prepare_output_directory(args)
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not args.cpu
@@ -606,9 +780,6 @@ def train(args):
         f"full={args.height}x{args.width}",
         f"expression={args.expression_size}x{args.expression_size}",
     )
-    print("Output directory:", args.out_dir)
-    save_run_metadata(args.out_dir, args, device)
-
     records = scan_records(args.train_dir, scale=args.scale)
     data_signature = dataset_signature(records, args.train_dir)
     train_records, val_records = stratified_split(
@@ -616,6 +787,57 @@ def train(args):
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
+    scales = SCALE_CODES if args.scale == "all" else (args.scale,)
+    args.rotation_policy = None
+    if args.angles is not None:
+        args.rotation_policy = {**angle_policy(args.angles, args.angle_weights),
+                                "rotation": ROTATION_CONTRACT, "pillow_version": PILLOW_VERSION}
+    args.selection_metric = ("application_weighted_mean_three_task_cross_entropy"
+                             if args.rotation_policy else "expression_cross_entropy")
+    face_boxes = None
+    args.face_cache_metadata = None
+    if args.face_annotations:
+        face_boxes = load_face_annotations(records, args.face_annotations)
+        data_signature += ":" + annotation_signature(args.face_annotations)
+        print("Expression crops: annotated faces, no upscaling, no extra margin")
+    elif getattr(args, "face_cache", None):
+        face_boxes, cache_signature, args.face_cache_metadata = load_face_cache(
+            records, args.face_cache, train_records, val_records, args.scale, args.seed, args.val_ratio,
+            angles=args.rotation_policy["angles"] if args.rotation_policy else None,
+        )
+        data_signature += ":locator_cache:" + cache_signature
+        print("Expression crops: fixed locator cache, no upscaling, no extra margin")
+        print("Validation and calibration use the same cached automatic boxes, without training augmentation")
+    if args.rotation_policy:
+        train_records = rotation_records(train_records, args.rotation_policy["angles"])
+        val_records = rotation_records(val_records, args.rotation_policy["angles"])
+        train_sampler = ContentScaleAngleSampler(train_records, scales, args.rotation_policy, args.seed)
+    else:
+        train_sampler = ContentBalancedSampler(train_records, scales, args.seed)
+    args.sampling_metadata = train_sampler.metadata(args.batch)
+    if args.rotation_policy:
+        args.sampling_metadata["planned_epochs"] = args.epochs
+        args.sampling_metadata["planned_samples"] = args.epochs * len(train_sampler)
+    validation_scale_counts = dict(Counter(record.scale for record in val_records))
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = load_torch_checkpoint(args.resume, "cpu")
+    resolve_face_min_scale(args, resume_checkpoint)
+    augmentation = resolve_augmentation(args, resume_checkpoint)
+    if args.resume:
+        validate_resume_config(resume_checkpoint, args, data_signature)
+        if not args.sampling_preview_only:
+            missing_state = {"optimizer_state", "scheduler_state", "scaler_state"} - resume_checkpoint.keys()
+            if missing_state:
+                raise ValueError("resume requires complete training state; use atri_net_last.pth, not the best inference checkpoint")
+    if face_box_source(args):
+        print(f"Face scale augmentation: {augmentation.shrink_probability:.0%} probability, {args.face_min_scale:.0%} to 100% of crop size")
+        print("Augmentation policy:", args.augmentation_config)
+    # Validate input data and resume compatibility before replacing run metadata.
+    args.out_dir = prepare_output_directory(args)
+    print("Output directory:", args.out_dir)
+    print("Expression head:", args.expression_head, "(shared backbone; outfit and pose still use the full view)")
+    save_run_metadata(args.out_dir, args, device)
     print_record_summary("Train", train_records)
     print_record_summary("Validation", val_records)
     save_split_manifest(
@@ -626,21 +848,58 @@ def train(args):
         args,
         data_signature,
     )
+    save_json(os.path.join(args.out_dir, "sampling_preview.json"), {
+        "description": "Planned complete joint/scale cycle, not executed training counts. Epochs are one-based.",
+        "sampling": args.sampling_metadata,
+        "validation": {
+            "samples": len(val_records), "scale_counts": validation_scale_counts,
+            "content_count": len({record.content_key for record in val_records}),
+            "angles": args.rotation_policy["angles"] if args.rotation_policy else [0], "augmentation": False,
+            "selection_metric": args.selection_metric,
+            "calibration_weighting": "application angle weights, equal scales and contents" if args.rotation_policy else "equal views",
+        },
+        "epochs": [train_sampler.epoch_summary(epoch, include_filenames=True)
+                   for epoch in range(args.sampling_metadata["cycle_epochs"])],
+    })
+    print(f"Sampling: {len(train_sampler)} contents/views per epoch; "
+          f"{args.sampling_metadata['batches_per_epoch']} batches; "
+          f"{args.sampling_metadata['cycle_epochs']}-epoch sampling cycle")
+    if args.epochs % args.sampling_metadata["cycle_epochs"]:
+        print("NOTE: training budget ends within a sampling cycle; per-content coverage is not exactly balanced.")
+    if args.scale == "all":
+        print("Validation/calibration: all five scales of held-out contents, no random sampling; "
+              "these are correlated views, not independent test contents")
+    if args.sampling_preview_only:
+        print("Saved validated split and sampling_preview.json; no model or optimizer was created.")
+        return
+
+    train_transform = build_dual_view_transform(
+        height=args.height, width=args.width, expression_size=args.expression_size, train=True,
+        expression_width_fraction=args.expression_width_fraction,
+        expression_height_fraction=args.expression_height_fraction, margin=args.margin,
+        face_crop=bool(face_box_source(args)), face_min_scale=args.face_min_scale,
+        augmentation=augmentation, collect_augmentation=True,
+    )
+    if args.augmentation_preview_only:
+        preview = save_augmentation_previews(
+            train_records, face_boxes, train_transform, args.out_dir,
+            args.augmentation_preview_count, args.augmentation_preview_repeats, args.seed,
+        )
+        print("Saved augmentation_preview.json and augmentation_previews:", preview["statistics"])
+        print("No model or optimizer was created; inspect previews before training.")
+        return
 
     train_dataset = AtriDataset(
         train_records,
-        paired_transform=build_dual_view_transform(
-            height=args.height,
-            width=args.width,
-            expression_size=args.expression_size,
-            train=True,
-            expression_width_fraction=args.expression_width_fraction,
-            expression_height_fraction=args.expression_height_fraction,
-            margin=args.margin,
-        ),
+        face_boxes=face_boxes,
+        paired_transform=train_transform,
+        view_metadata=bool(args.rotation_policy),
     )
     val_dataset = AtriDataset(
         val_records,
+        face_boxes=face_boxes,
+        view_metadata=bool(args.rotation_policy),
+        angle_weights=dict(zip(args.rotation_policy["angles"], args.rotation_policy["weights"])) if args.rotation_policy else None,
         paired_transform=build_dual_view_transform(
             height=args.height,
             width=args.width,
@@ -649,6 +908,8 @@ def train(args):
             expression_width_fraction=args.expression_width_fraction,
             expression_height_fraction=args.expression_height_fraction,
             margin=args.margin,
+            face_crop=bool(face_box_source(args)),
+            face_min_scale=args.face_min_scale,
         ),
     )
 
@@ -664,7 +925,7 @@ def train(args):
 
     train_loader = DataLoader(
         train_dataset,
-        shuffle=True,
+        sampler=train_sampler,
         generator=generator,
         **loader_options,
     )
@@ -677,6 +938,7 @@ def train(args):
     model = AtriNet(
         pretrained=not args.no_pretrained and not args.resume,
         dropout=args.dropout,
+        expression_head=args.expression_head,
     ).to(device)
     optimizer = torch.optim.AdamW(
         [
@@ -702,8 +964,6 @@ def train(args):
     history = []
     best_calibration = {}
     if args.resume:
-        checkpoint = load_torch_checkpoint(args.resume, device)
-        validate_resume_config(checkpoint, args, data_signature)
         (
             start_epoch,
             best_expression_loss,
@@ -711,22 +971,29 @@ def train(args):
             history,
             best_calibration,
         ) = restore_training_state(
-            checkpoint,
+            resume_checkpoint,
             model,
             optimizer,
             scheduler,
             scaler,
         )
+        del resume_checkpoint
         print(f"Resumed from epoch {start_epoch}: {args.resume}")
 
     best_path = os.path.join(args.out_dir, "atri_net_best.pth")
     last_path = os.path.join(args.out_dir, "atri_net_last.pth")
 
     print("Training started.")
+    cumulative_optimizer_steps = sum(item["train"].get("optimizer_steps", 0) for item in history)
     for epoch_index in range(start_epoch, args.epochs):
         epoch = epoch_index + 1
+        train_sampler.set_epoch(epoch_index)
+        sampled = train_sampler.epoch_summary(epoch_index)
+        print(f"Sampling epoch {epoch}: {sampled['scale_counts']}")
         backbone_trainable = epoch_index >= args.warmup_epochs
         model.set_backbone_trainable(backbone_trainable)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         train_metrics = run_epoch(
             model,
@@ -748,6 +1015,19 @@ def train(args):
                 device,
                 amp_enabled,
             )
+        if train_metrics["samples"] != sampled["samples"]:
+            raise RuntimeError("training sample count differs from the recorded sampling policy")
+        train_metrics["scale_counts"] = sampled["scale_counts"]
+        val_metrics["scale_counts"] = validation_scale_counts
+        if args.rotation_policy:
+            train_metrics["sampling"] = sampled
+            for angle, counts in sampled["angle_scale_counts"].items():
+                for scale, expected in counts.items():
+                    observed = train_metrics["by_angle_scale"].get(f"{angle}/{scale}", {}).get("samples", 0)
+                    if observed != expected:
+                        raise RuntimeError("observed joint sampling counts differ from the sampler")
+            val_metrics["selection"] = validation_selection(val_metrics["by_angle_scale"], args.rotation_policy, scales, TASKS)
+        cumulative_optimizer_steps += train_metrics["optimizer_steps"]
 
         if backbone_trainable:
             scheduler.step()
@@ -756,6 +1036,7 @@ def train(args):
             "epoch": epoch,
             "train": train_metrics,
             "validation": val_metrics,
+            "cumulative_optimizer_steps": cumulative_optimizer_steps,
             "learning_rates": {
                 "backbone": optimizer.param_groups[0]["lr"],
                 "heads": optimizer.param_groups[1]["lr"],
@@ -764,8 +1045,14 @@ def train(args):
         print(f"Epoch [{epoch}/{args.epochs}]")
         print(" ", format_metrics("train", train_metrics))
         print(" ", format_metrics("validation", val_metrics))
+        print(f"  Optimizer steps: {train_metrics['optimizer_steps']} "
+              f"({train_metrics['skipped_optimizer_steps']} AMP skips); total={cumulative_optimizer_steps}")
+        if train_metrics["face_augmentation"]:
+            print("  Face augmentation:", train_metrics["face_augmentation"])
 
-        monitored_loss = val_metrics["task_loss"]["expression"]
+        monitored_loss = val_metrics["selection"]["loss"] if args.rotation_policy else val_metrics["task_loss"]["expression"]
+        if args.rotation_policy:
+            print("  Application-weighted three-task validation:", val_metrics["selection"])
         improved = monitored_loss < best_expression_loss
         if improved:
             best_expression_loss = monitored_loss
@@ -785,6 +1072,20 @@ def train(args):
                 collected,
                 threshold_quantile=args.threshold_quantile,
             )
+            if args.rotation_policy:
+                best_calibration["distribution"] = {"angles": args.rotation_policy["angles"],
+                    "angle_weights": args.rotation_policy["weights"], "scales": list(scales),
+                    "scale_weights": [1 / len(scales)] * len(scales), "contents": "equal development-validation contents",
+                    "locator_sha256": args.face_cache_metadata["locator"]["sha256"],
+                    "note": "Model selection and calibration reuse development validation; this is not independent test calibration."}
+
+        if device.type == "cuda":
+            memory = {
+                "allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
+                "reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20,
+            }
+            history[-1]["cuda_peak_memory"] = memory
+            print(f"  CUDA peak: {memory['allocated_mib']:.0f} MiB allocated / {memory['reserved_mib']:.0f} MiB reserved")
 
         checkpoint = make_checkpoint(
             model,
@@ -855,13 +1156,39 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--epochs", type=int, default=90)
     parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--width", type=int, default=320)
-    parser.add_argument("--expression_size", type=int, default=512)
+    parser.add_argument("--height", type=int, default=768)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--expression_size", type=int, help="default: 300 with face cache, 626 with face annotations, otherwise 512")
+    parser.add_argument("--expression_head", choices=EXPRESSION_HEADS, default="fusion",
+                        help="expression features: fusion=full+face (default), face_only=face; both share the backbone")
+    face_inputs = parser.add_mutually_exclusive_group()
+    face_inputs.add_argument("--face_annotations", help="annotation-tool CSV; enables original-image face crops")
+    face_inputs.add_argument("--face_cache", help="automatic-box cache directory produced by face_box_cache.py")
+    parser.add_argument(
+        "--face_min_scale", type=float,
+        help="minimum face scale during training augmentation (new runs: 0.30; resume: checkpoint setting)",
+    )
+    parser.add_argument("--face_jitter", choices=("legacy", "mixed", "none"),
+                        help="new face runs: mixed; resume: inherit. mixed replaces legacy crop shift and disables face affine translation")
+    for flag in ("face_size_jitter", "face_shrink_probability", "face_keep_probability", "face_small_probability",
+                 "face_small_pixels", "face_wide_pixels", "face_translate", "full_translate", "flip_probability",
+                 "affine_degrees", "affine_scale_min", "affine_scale_max", "color_jitter"):
+        parser.add_argument("--" + flag, type=float, help="override augmentation policy; defaults and resolved values are saved in run_config.json")
+    parser.add_argument("--face_jitter_attempts", type=int, help="in-bounds resampling attempts, default 16")
     parser.add_argument("--expression_width_fraction", type=float, default=0.65)
     parser.add_argument("--expression_height_fraction", type=float, default=0.50)
     parser.add_argument("--margin", type=float, default=0.04)
-    parser.add_argument("--scale", choices=SCALE_CODES, default="w")
+    parser.add_argument("--scale", choices=(*SCALE_CODES, "all"),
+                        help="all: balanced s/w/m/l/ll sampling; default: l with face annotations, otherwise w")
+    parser.add_argument("--angles", type=float, nargs="+", help="D2: source angles from a rotated cache; use 0 for the matched upright control")
+    parser.add_argument("--angle_weights", type=float, nargs="+", help="positive relative weights; six-angle default is 45/20/5/5/5/20")
+    preview_modes = parser.add_mutually_exclusive_group()
+    preview_modes.add_argument("--sampling_preview_only", action="store_true",
+                        help="validate data/cache and save split/sampling metadata, then stop before allocating a model")
+    preview_modes.add_argument("--augmentation_preview_only", action="store_true",
+                              help="export actual training inputs and offset metadata; no model or optimizer")
+    parser.add_argument("--augmentation_preview_count", type=int, default=21, help="training images per scale/angle, default 21")
+    parser.add_argument("--augmentation_preview_repeats", type=int, default=4, help="draws per preview image, default 4")
     parser.add_argument("--val_ratio", type=float, default=0.25)
     parser.add_argument("--lr_backbone", type=float, default=1e-4)
     parser.add_argument("--lr_heads", type=float, default=3e-4)
