@@ -7,4 +7,12 @@ outputs/
 outputs_*/
 evaluation/
 dataset_report.json
+/release_manifest.json
 *.onnx
+
+# Models and their companion files are distributed through GitHub Releases.
+/models/
+*.pth
+.weights-export-*/
+.DS_Store
+Thumbs.db

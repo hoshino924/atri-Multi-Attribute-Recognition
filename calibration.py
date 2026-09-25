@@ -10,9 +10,12 @@ def collect_logits(model, loader, device, tasks, amp_enabled=False):
     model.eval()
     logits = {task: [] for task in tasks}
     targets = {task: [] for task in tasks}
+    weights = []
 
     with torch.inference_mode():
         for views, batch_targets in loader:
+            if "_sample_weight" in views:
+                weights.append(views["_sample_weight"].detach().float().cpu())
             full_image = views["full"].to(device, non_blocking=True)
             expression_image = views["expression"].to(
                 device,
@@ -32,16 +35,25 @@ def collect_logits(model, loader, device, tasks, amp_enabled=False):
         task: {
             "logits": torch.cat(logits[task]),
             "targets": torch.cat(targets[task]),
+            **({"weights": torch.cat(weights)} if weights else {}),
         }
         for task in tasks
     }
 
 
-def expected_calibration_error(logits, targets, bins=10):
+def sample_weights(targets, weights=None):
+    weights = torch.ones_like(targets, dtype=torch.float32) if weights is None else weights.to(targets.device).float()
+    if weights.shape != targets.shape or not torch.isfinite(weights).all() or not (weights > 0).all():
+        raise ValueError("calibration weights must be finite, positive and match the targets")
+    return weights / weights.sum()
+
+
+def expected_calibration_error(logits, targets, bins=10, weights=None):
     """Calculate expected calibration error for one classification task."""
     probabilities = torch.softmax(logits, dim=1)
     confidence, predictions = probabilities.max(dim=1)
     correct = predictions.eq(targets)
+    weights = sample_weights(targets, weights)
     error = torch.zeros((), dtype=torch.float32, device=confidence.device)
     boundaries = torch.linspace(
         0.0,
@@ -54,16 +66,18 @@ def expected_calibration_error(logits, targets, bins=10):
         in_bin = confidence.gt(lower) & confidence.le(upper)
         if not in_bin.any():
             continue
-        bin_accuracy = correct[in_bin].float().mean()
-        bin_confidence = confidence[in_bin].mean()
-        error += in_bin.float().mean() * (bin_accuracy - bin_confidence).abs()
+        mass = weights[in_bin].sum()
+        bin_accuracy = (correct[in_bin].float() * weights[in_bin]).sum() / mass
+        bin_confidence = (confidence[in_bin] * weights[in_bin]).sum() / mass
+        error += mass * (bin_accuracy - bin_confidence).abs()
     return error.item()
 
 
-def fit_temperature(logits, targets):
+def fit_temperature(logits, targets, weights=None):
     """Fit one positive temperature by minimizing validation NLL."""
     logits = logits.detach().float().cpu()
     targets = targets.detach().long().cpu()
+    weights = sample_weights(targets, weights)
     log_temperature = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.LBFGS(
         [log_temperature],
@@ -75,7 +89,7 @@ def fit_temperature(logits, targets):
     def closure():
         optimizer.zero_grad()
         temperature = log_temperature.exp().clamp(0.25, 10.0)
-        loss = functional.cross_entropy(logits / temperature, targets)
+        loss = (functional.cross_entropy(logits / temperature, targets, reduction="none") * weights).sum()
         loss.backward()
         return loss
 
@@ -89,17 +103,23 @@ def build_calibration(collected, threshold_quantile=0.05):
     for task, values in collected.items():
         logits = values["logits"]
         targets = values["targets"]
-        temperature = fit_temperature(logits, targets)
+        weights = values.get("weights")
+        normalized_weights = sample_weights(targets, weights)
+        temperature = fit_temperature(logits, targets, weights)
         calibrated_logits = logits / temperature
         probabilities = torch.softmax(calibrated_logits, dim=1)
         confidence, predictions = probabilities.max(dim=1)
         correct = predictions.eq(targets)
 
         if correct.any():
-            threshold = torch.quantile(
-                confidence[correct],
-                threshold_quantile,
-            ).item()
+            if weights is None:
+                threshold = torch.quantile(confidence[correct], threshold_quantile).item()
+            else:
+                ordered, order = confidence[correct].sort()
+                mass = normalized_weights[correct][order]
+                cdf = mass.cumsum(0) / mass.sum()
+                index = torch.searchsorted(cdf, torch.tensor(threshold_quantile, device=cdf.device)).clamp(max=len(ordered) - 1)
+                threshold = ordered[index].item()
             threshold = min(threshold, 0.95)
         else:
             threshold = 1.0
@@ -107,13 +127,15 @@ def build_calibration(collected, threshold_quantile=0.05):
         task_calibration[task] = {
             "temperature": temperature,
             "suggested_threshold": threshold,
-            "validation_accuracy": correct.float().mean().item(),
-            "ece_before": expected_calibration_error(logits, targets),
+            "validation_accuracy": (correct.float() * normalized_weights).sum().item(),
+            "ece_before": expected_calibration_error(logits, targets, weights=weights),
             "ece_after": expected_calibration_error(
                 calibrated_logits,
                 targets,
+                weights=weights,
             ),
             "support": targets.numel(),
+            "weighted": weights is not None,
         }
 
     return {

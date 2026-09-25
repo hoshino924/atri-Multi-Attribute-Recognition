@@ -18,8 +18,12 @@ from dataset import (
     build_transform,
 )
 from labels import TASK_CODES, TASK_LABELS
-from model import AtriNet
+from model import AtriNet, checkpoint_expression_head
 from visualization import generate_gradcam, overlay_gradcam
+from face_regions import FACE_CROP_MODE
+from face_locator import FaceLocator, FaceNotFoundError, LocatedFacePreview, LocatedFaceTransform
+from image_rotation import ROTATION_CONTRACT
+from app_assets import DEFAULT_CLASSIFIER_WEIGHT, DEFAULT_LOCATOR_WEIGHT, configure_taskbar, set_app_icon
 
 
 TASKS = tuple(TASK_CODES.keys())
@@ -33,7 +37,7 @@ def load_torch_checkpoint(path, device):
         return torch.load(path, map_location=device)
 
 
-def load_model(weight_path, device):
+def load_model(weight_path, device, locator_weight=None, locator_threshold=None):
     """Load the model and preprocessing configuration from a checkpoint."""
     checkpoint = load_torch_checkpoint(weight_path, device)
     if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
@@ -41,11 +45,24 @@ def load_model(weight_path, device):
             "this weight file uses the old four-task format; retrain the new "
             "three-task model first"
         )
-    if checkpoint.get("format_version") != 3:
+    if checkpoint.get("format_version") not in (3, 4):
         raise ValueError(
             "this checkpoint predates the focused expression view; retrain "
             "the dual-view model first"
         )
+    rotation_training = checkpoint.get("rotation_training")
+    if rotation_training:
+        if rotation_training.get("rotation") != ROTATION_CONTRACT:
+            raise ValueError("unsupported classifier rotation contract")
+        expected_locator = (checkpoint.get("face_cache_metadata") or {}).get("locator", {})
+        if not expected_locator.get("sha256"):
+            raise ValueError("rotated classifier lacks its fixed locator identity")
+        if locator_weight:
+            from face_box_cache import file_sha256
+            if file_sha256(locator_weight) != expected_locator["sha256"]:
+                raise ValueError("locator weights differ from classifier training/calibration")
+            if locator_threshold is not None and locator_threshold != expected_locator.get("threshold"):
+                raise ValueError("locator threshold differs from classifier training/calibration")
 
     label_codes = checkpoint.get("label_codes", TASK_CODES)
     if set(label_codes.keys()) != set(TASKS):
@@ -63,6 +80,7 @@ def load_model(weight_path, device):
             )
 
     model_config = checkpoint.get("model_config", {})
+    expression_head = checkpoint_expression_head(checkpoint)
     task_sizes = {
         task: len(label_codes[task])
         for task in TASKS
@@ -71,6 +89,7 @@ def load_model(weight_path, device):
         pretrained=False,
         dropout=model_config.get("dropout", 0.2),
         task_sizes=task_sizes,
+        expression_head=expression_head,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -78,6 +97,15 @@ def load_model(weight_path, device):
     preprocess = checkpoint.get("preprocess", {})
     full_config = preprocess.get("full", {})
     expression_config = preprocess.get("expression", {})
+    face_mode = checkpoint["format_version"] == 4
+    if face_mode:
+        if (expression_config.get("mode") != FACE_CROP_MODE
+                or expression_config.get("allow_upscale") is not False
+                or expression_config.get("margin") != 0.0
+                or expression_config.get("coordinate_system") != "bottom_left_pixels"):
+            raise ValueError("unsupported face preprocessing contract in checkpoint")
+    elif expression_config.get("mode", "foreground") != "foreground":
+        raise ValueError("unsupported legacy expression crop mode")
     background = tuple(preprocess.get("background", (0, 0, 0)))
     normalization = preprocess.get("normalization", {})
     mean = tuple(normalization.get("mean", (0.485, 0.456, 0.406)))
@@ -118,11 +146,22 @@ def load_model(weight_path, device):
             std=std,
         ),
     }
+    if face_mode:
+        resolved_preprocess["expression"] = dict(expression_config)
+        locator = FaceLocator.from_checkpoint(locator_weight, device, locator_threshold) if locator_weight else None
+        preview = LocatedFacePreview(expression_config["size"], background, locator)
+        image_transforms["expression"] = LocatedFaceTransform(preview, mean, std)
+        model.face_preview = preview
     model.calibration = checkpoint.get("calibration", {})
     model.preprocess_config = resolved_preprocess
     model.checkpoint_metadata = {
         "epoch": checkpoint.get("epoch"),
         "format_version": checkpoint.get("format_version"),
+        "model_config": {**model_config, "expression_head": expression_head},
+        "rotation_training": rotation_training,
+        "dataset_signature": checkpoint.get("dataset_signature"),
+        "face_cache_metadata": checkpoint.get("face_cache_metadata"),
+        "selection_metric": checkpoint.get("selection_metric", "expression_cross_entropy"),
     }
     return model, image_transforms, label_codes
 
@@ -196,6 +235,13 @@ def predict(
             "candidates": candidates,
         }
 
+    if hasattr(model, "face_preview"):
+        box = model.face_preview.last_box
+        result["face"] = {
+            "coordinate_system": "bottom_left_pixels",
+            "x_left": box.x_left, "y_bottom": box.y_bottom, "side": box.side,
+            "confidence": model.face_preview.last_confidence,
+        }
     return image, result
 
 
@@ -233,17 +279,14 @@ def batch_predict(
     """Predict a sequence of files and return JSON-serializable records."""
     records = []
     for path in paths:
-        _, result = predict(
-            model,
-            path,
-            device,
-            image_transforms,
-            label_codes,
-            top_k=top_k,
-            min_confidence=min_confidence,
-            accept_all=accept_all,
-        )
-        records.append({"file": str(path), "predictions": result})
+        try:
+            _, result = predict(
+                model, path, device, image_transforms, label_codes,
+                top_k=top_k, min_confidence=min_confidence, accept_all=accept_all,
+            )
+            records.append({"file": str(path), "status": "ok", "predictions": result})
+        except FaceNotFoundError as exc:
+            records.append({"file": str(path), "status": "face_not_found", "error": str(exc), "predictions": None})
     return records
 
 
@@ -252,7 +295,7 @@ def save_batch_results(records, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.suffix.lower() == ".csv":
-        fieldnames = ["file"]
+        fieldnames = ["file", "status", "error"]
         for task in TASKS:
             fieldnames.extend([
                 f"{task}_code",
@@ -266,7 +309,10 @@ def save_batch_results(records, output_path):
             writer = csv.DictWriter(stream, fieldnames=fieldnames)
             writer.writeheader()
             for record in records:
-                row = {"file": record["file"]}
+                row = {"file": record["file"], "status": record.get("status", "ok"), "error": record.get("error", "")}
+                if record["predictions"] is None:
+                    writer.writerow(row)
+                    continue
                 for task in TASKS:
                     prediction = record["predictions"][task]
                     row.update({
@@ -299,7 +345,7 @@ def build_preview_transforms(model):
             margin=full["margin"],
             background=background,
         ),
-        "expression": build_expression_preview(
+        "expression": model.face_preview if hasattr(model, "face_preview") else build_expression_preview(
             size=expression["size"],
             width_fraction=expression["width_fraction"],
             height_fraction=expression["height_fraction"],
@@ -315,7 +361,9 @@ def start_gui(model, device, image_transforms, label_codes):
     from tkinter import filedialog, messagebox, ttk
     from PIL import ImageTk
 
+    configure_taskbar("Recognition")
     root = tk.Tk()
+    set_app_icon(root)
     root.title("ATRI Multi-Attribute Recognition")
     root.geometry("1120x850")
     root.minsize(900, 720)
@@ -431,6 +479,11 @@ def start_gui(model, device, image_transforms, label_codes):
             result_label.configure(text=result_text(result))
             status_label.configure(text=Path(path).name)
         except Exception as exc:
+            state["image"] = state["result"] = None
+            for name in preview_labels:
+                preview_labels[name].configure(image="")
+            state["photos"].clear()
+            result_label.configure(text="No prediction available.")
             messagebox.showerror("Inference failed", str(exc), parent=root)
 
     def show_gradcam():
@@ -482,7 +535,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run GUI, single-image, or directory inference."
     )
-    parser.add_argument("--weight", default="outputs/atri_net_best.pth")
+    parser.add_argument("--weight", default=DEFAULT_CLASSIFIER_WEIGHT)
+    parser.add_argument("--locator_weight", default=DEFAULT_LOCATOR_WEIGHT,
+                        help="independent face locator checkpoint for face-crop models")
+    parser.add_argument("--locator_threshold", type=float, help="override locator confidence threshold")
     parser.add_argument("--input", help="image file or directory; omit for GUI")
     parser.add_argument("--output", help="batch result path ending in .json or .csv")
     parser.add_argument("--recursive", action="store_true")
@@ -510,7 +566,9 @@ def main():
     )
     print("Using device:", device)
 
-    model, image_transforms, label_codes = load_model(args.weight, device)
+    model, image_transforms, label_codes = load_model(args.weight, device, args.locator_weight, args.locator_threshold)
+    if hasattr(model, "face_preview") and model.face_preview.locator is None:
+        parser.error("this face-crop classifier requires --locator_weight")
     if args.input:
         paths = collect_input_paths(args.input, recursive=args.recursive)
         records = batch_predict(

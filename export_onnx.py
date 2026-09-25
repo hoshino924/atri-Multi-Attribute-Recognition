@@ -99,7 +99,15 @@ def export(args):
         },
         "outputs": list(TASKS),
         "label_codes": label_codes,
+        "model_config": model.checkpoint_metadata["model_config"],
         "preprocess": preprocess,
+        "external_face_localization_required": hasattr(model, "face_preview"),
+        "face_localization_note": (
+            "Run the independent locator, map its square to original-image pixels, "
+            "crop, downscale only if larger than expression size, then center-pad. "
+            "Localization, cropping and face-presence rejection are not inside this ONNX graph."
+            if hasattr(model, "face_preview") else None
+        ),
         "calibration": model.calibration,
     }
     with metadata_path.open("w", encoding="utf-8") as stream:
@@ -111,7 +119,8 @@ def export(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Export an ATRI model to ONNX.")
-    parser.add_argument("--weight", default="outputs/atri_net_best.pth")
+    from app_assets import DEFAULT_CLASSIFIER_WEIGHT
+    parser.add_argument("--weight", default=DEFAULT_CLASSIFIER_WEIGHT)
     parser.add_argument("--output", default="outputs/atri_net.onnx")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--batch", type=int, default=1)
